@@ -1,0 +1,2 @@
+# Extra defaults for tools/selftest.sh (layered on sdkconfig.defaults).
+CONFIG_DASHCAR_SELFTEST=y

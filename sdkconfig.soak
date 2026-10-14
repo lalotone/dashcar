@@ -1,0 +1,2 @@
+# Extra defaults for tools/soak.sh (layered on sdkconfig.defaults).
+CONFIG_DASHCAR_SOAK=y

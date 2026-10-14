@@ -1,0 +1,18 @@
+menu "DashCar"
+
+config DASHCAR_SELFTEST
+    bool "Run the scripted touch self-test after boot"
+    default n
+    help
+        Debug only. Builds main/debug/selftest.c and starts it ~12 s after boot. Use
+        tools/selftest.sh, which builds into build-selftest/ so normal builds never include it.
+
+config DASHCAR_SOAK
+    bool "Run the ~35 min soak test (simulated drive + UI user + monitor) after boot"
+    default n
+    help
+        Debug only. Builds main/debug/soak.c. Use tools/soak.sh, which builds into build-soak/ and needs
+        the phone hotspot (real downloads are part of the workload). Trip totals and the parking spot
+        use separate NVS keys in this build, so the real ones are untouched.
+
+endmenu

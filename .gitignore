@@ -1,0 +1,14 @@
+# Build output and downloaded components (fetched by idf.py at the versions in dependencies.lock)
+build/
+build-*/
+managed_components/
+sdkconfig
+sdkconfig.old
+# Board's original firmware dump (16 MB, vendor image)
+backup/
+# Editors / tooling
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.cache/

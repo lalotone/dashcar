@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "esp_lv_adapter.h"
+#include "esp_timer.h"
 #include "ui/touch_input.h"
 #include "net/wifi_mgr.h"
 #include "services/gps.h"
@@ -36,6 +37,7 @@ static lv_obj_t *s_night;
 #define NIGHT_MARGIN_S   (20 * 60)    // after sunset / before sunrise (it's still light at sunset)
 #define NIGHT_FALLBACK_START 21       // local hours, if the forecast has no sun times yet
 #define NIGHT_FALLBACK_END   7
+#define HEADING_HOLD_US  (120 * 1000000LL)  // last course kept while stopped
 
 static const lv_font_t *ttf(bool bold, int32_t size, const lv_font_t *symbols)
 {
@@ -512,6 +514,103 @@ void ui_speed_sign_set(lv_obj_t *sign, int kmh, bool over)
         lv_obj_set_style_bg_color(sign, bg, 0);
         lv_obj_set_style_text_color(l, over ? lv_color_white() : lv_color_black(), 0);
     }
+}
+
+// Heading marker, drawn here: a dot with a white ring, or with a heading a navigation arrow.
+// Colour = the bg_color style (bg_opa stays transparent); heading in user_data as degrees + 1
+// (0 = dot).
+static void heading_point(lv_point_precise_t *p, float x, float y, float sn, float cs, int32_t cx, int32_t cy)
+{
+    p->x = cx + (int32_t)lroundf(x * cs - y * sn);
+    p->y = cy + (int32_t)lroundf(x * sn + y * cs);
+}
+
+static void heading_arrow(lv_layer_t *layer, int32_t cx, int32_t cy, float r, float sn, float cs, lv_color_t color)
+{
+    // Chevron: tip, right wing, notch, left wing; drawn as two triangles (it is concave).
+    const float tip = -r, wing = 0.72f * r, back = 0.8f * r, notch = 0.35f * r;
+    lv_draw_triangle_dsc_t d;
+    lv_draw_triangle_dsc_init(&d);
+    d.color = color;
+    d.opa = LV_OPA_COVER;
+    heading_point(&d.p[0], 0, tip, sn, cs, cx, cy);
+    heading_point(&d.p[1], wing, back, sn, cs, cx, cy);
+    heading_point(&d.p[2], 0, notch, sn, cs, cx, cy);
+    lv_draw_triangle(layer, &d);
+    heading_point(&d.p[1], -wing, back, sn, cs, cx, cy);
+    lv_draw_triangle(layer, &d);
+}
+
+static void heading_draw(lv_event_t *e)
+{
+    lv_obj_t *m = lv_event_get_target_obj(e);
+    const intptr_t v = (intptr_t)lv_obj_get_user_data(m);
+    const lv_color_t color = lv_obj_get_style_bg_color(m, 0);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_area_t a;
+    lv_obj_get_coords(m, &a);
+    const int32_t cx = (a.x1 + a.x2) / 2, cy = (a.y1 + a.y2) / 2;
+    const int32_t size = lv_area_get_width(&a);
+    if (v == 0) {
+        const int32_t r = size / 4;  // half the size: an arrow needs more room than a dot
+        lv_draw_rect_dsc_t d;
+        lv_draw_rect_dsc_init(&d);
+        d.radius = LV_RADIUS_CIRCLE;
+        d.bg_color = color;
+        d.border_color = lv_color_white();
+        d.border_width = r >= 7 ? 3 : 2;
+        const lv_area_t dot = { cx - r, cy - r, cx + r, cy + r };
+        lv_draw_rect(layer, &d, &dot);
+        return;
+    }
+    const float r = size / 2.0f - 1;
+    const float rad = (float)(v - 1) * (float)M_PI / 180.0f;
+    const float sn = sinf(rad), cs = cosf(rad);
+    heading_arrow(layer, cx, cy, r, sn, cs, lv_color_white());
+    // Inner arrow, nudged towards the tip so the white edge looks even.
+    heading_arrow(layer, cx + (int32_t)lroundf(0.1f * r * sn), cy - (int32_t)lroundf(0.1f * r * cs),
+                  r * 0.62f, sn, cs, color);
+}
+
+lv_obj_t *ui_heading_marker_create(lv_obj_t *parent, int32_t size, lv_color_t color)
+{
+    lv_obj_t *m = lv_obj_create(parent);
+    lv_obj_remove_style_all(m);
+    lv_obj_set_size(m, size, size);
+    lv_obj_set_style_bg_color(m, color, 0);
+    lv_obj_set_clickable(m, false);
+    lv_obj_set_scrollable(m, false);
+    lv_obj_add_event_cb(m, heading_draw, LV_EVENT_DRAW_MAIN, NULL);
+    return m;
+}
+
+void ui_heading_marker_set(lv_obj_t *m, float deg)
+{
+    // 5° steps: the GPS course jitters by a degree or two, and every change is a redraw.
+    const intptr_t v = deg < 0 ? 0 : 1 + ((int)lroundf(deg / 5.0f) * 5) % 360;
+    if (v != (intptr_t)lv_obj_get_user_data(m)) {
+        lv_obj_set_user_data(m, (void *)v);
+        lv_obj_invalidate(m);
+    }
+}
+float ui_gps_heading(void)
+{
+    // A red light shouldn't turn the arrow into a dot: keep the last course for a while.
+    static float s_last = -1;
+    static int64_t s_last_us;
+    gps_fix_t f;
+    int sats;
+    if (gps_state(&sats) != GPS_FIX || !gps_get(&f)) {
+        return -1;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (f.speed_kmh > 0) {
+        s_last = f.course;
+        s_last_us = now;
+    } else if (s_last >= 0 && now - s_last_us > HEADING_HOLD_US) {
+        s_last = -1;
+    }
+    return s_last;
 }
 
 bool ui_speed_over_limit(float kmh, int limit)

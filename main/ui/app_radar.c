@@ -2,6 +2,8 @@
 //  - the last ~2 hours of real radar (RainViewer, zoom 7 max on the free tier), and
 //  - the next 12 hours of forecast rain + clouds (Open-Meteo, sampled on a grid and interpolated),
 // on one timeline that can be scrubbed or played.
+// The car is an arrow along the GPS course (moved live), and a chip says whether there is rain
+// ahead on that heading and which way the rain itself is moving (estimated from the radar frames).
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +14,7 @@
 #include "freertos/task.h"
 #include "net/http_util.h"
 #include "net/wifi_mgr.h"
+#include "services/gps.h"
 #include "services/map_tiles.h"
 #include "services/net_worker.h"
 #include "services/rain_now.h"
@@ -36,6 +39,16 @@ static const char *TAG = "radar";
 #define GRID_ROWS   7
 #define RAIN_LUT_N  500                 // rain colour LUT, 0.05 mm steps up to 25 mm/h
 #define PLAY_MS     800
+#define FOLLOW_MS   2000                // car marker + rain-ahead chip
+#define AHEAD_KM    40                  // rain search along the car's heading
+#define NEAR_KM     60                  // "nearest rain" search radius
+#define ETA_MAX_H   3.0f                // "rain reaching you" look-ahead (rain cells change)
+#define MOTION_CELL 4                   // radar px per cell of the motion-estimate grid
+#define MOTION_W    (RADAR_W / MOTION_CELL)
+#define MOTION_H    (RADAR_H / MOTION_CELL)
+#define MOTION_MAX_KMH 100.0f           // search range for rain motion
+#define MOTION_SPAN_S  (60 * 60)        // compare the newest frame with one about this much older
+#define MOTION_MAX_R   30               // search radius cap, grid cells
 
 #define RGB565(r, g, b) ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
 
@@ -49,6 +62,7 @@ typedef struct {
     bool cancel;                  // screen closed
     int32_t utc_offset;
     int ox, oy;                   // world pixel (MAP_Z) of the map's top-left corner
+    float km_px;                  // km per radar pixel (RADAR_Z) at the map centre
 
     uint8_t *base;                // base map, 8-bit grey: Esri Dark Gray is grey anyway, and this
                                   // saves 550 KB of PSRAM (the Radar needs ~3 MB, see ESP32-info §4)
@@ -62,6 +76,7 @@ typedef struct {
     uint8_t *past[MAX_PAST];      // palette indices, RADAR_W x RADAR_H, 0 = transparent
     pal_t palette[256];
     uint32_t pal_key[256];
+    bool pal_rain[256];           // counts as rain for "ahead" and motion (see palette_index)
     int palette_n;
 
     bool fc_ready;
@@ -69,6 +84,9 @@ typedef struct {
     time_t fc_time[FC_HOURS + 1]; // [0] = current hour
     uint8_t cloud[FC_HOURS + 1][GRID_ROWS][GRID_COLS];      // %
     uint16_t rain[FC_HOURS + 1][GRID_ROWS][GRID_COLS];      // 0.05 mm units
+
+    bool motion_ok;               // rain_vx/vy estimated
+    float rain_vx, rain_vy;       // rain motion, radar px per hour (+x east, +y south)
 } radar_ctx_t;
 
 static radar_ctx_t *s_ctx;
@@ -82,10 +100,17 @@ static lv_obj_t *s_play_label;
 static lv_obj_t *s_rain_btn;
 static lv_obj_t *s_cloud_btn;
 static lv_timer_t *s_play_timer;
+static lv_obj_t *s_you;           // car marker (arrow when moving)
+static lv_obj_t *s_info;          // rain-ahead / rain-motion chip
+static lv_obj_t *s_info_arrow;
+static lv_obj_t *s_info_motion;
+static lv_obj_t *s_info_here;
 static int s_frame;
 static bool s_show_rain = true;
 static bool s_show_clouds = true;
 static pal_t s_rain_lut[RAIN_LUT_N];
+
+static void info_update(radar_ctx_t *c);
 
 // ---------------------------------------------------------------------------
 // Context lifetime
@@ -171,6 +196,9 @@ static uint8_t palette_index(radar_ctx_t *c, uint8_t r, uint8_t g, uint8_t b, ui
         int i = ++c->palette_n;
         c->pal_key[i] = key;
         c->palette[i] = (pal_t){ RGB565(r, g, b), a };
+        // RainViewer draws weak echoes (drizzle aloft, ground clutter) as translucent beige
+        // (alpha 20-190, red > blue); rain is opaque blue..red, snow light cyan (blue > red).
+        c->pal_rain[i] = a == 255 || b > r;
         return i;
     }
     // Palette full: nearest colour.
@@ -627,6 +655,9 @@ static void load_radar(radar_ctx_t *c, http_session_t *http)
             timeline_update();
             if (first) {
                 render();
+                if (s_ctx == c) {  // not an older instance's loader (double tap)
+                    info_update(c);
+                }
             } else {
                 update_labels(c);
             }
@@ -634,6 +665,137 @@ static void load_radar(radar_ctx_t *c, http_session_t *http)
         ui_unlock();
     }
     cJSON_Delete(root);
+}
+
+// ---------------------------------------------------------------------------
+// Rain motion (network worker): block matching of the newest radar frame against one about an
+// hour older, on a coarse rain-coverage grid, refined to sub-cell precision.
+
+static void motion_grid(const uint8_t *frame, const bool *pal_rain, uint8_t *g)
+{
+    for (int j = 0; j < MOTION_H; j++) {
+        for (int i = 0; i < MOTION_W; i++) {
+            int n = 0;
+            for (int y = 0; y < MOTION_CELL; y++) {
+                const uint8_t *row = frame + (size_t)(j * MOTION_CELL + y) * RADAR_W + i * MOTION_CELL;
+                for (int x = 0; x < MOTION_CELL; x++) {
+                    n += pal_rain[row[x]];
+                }
+            }
+            g[j * MOTION_W + i] = n;
+        }
+    }
+}
+
+// Mean |old(p) - cur(p + d)| over the overlap (x256); rain at p in `old` is at p + d in `cur`.
+static uint32_t motion_cost(const uint8_t *old, const uint8_t *cur, int dx, int dy)
+{
+    const int x0 = LV_MAX(0, -dx), x1 = LV_MIN(MOTION_W, MOTION_W - dx);
+    const int y0 = LV_MAX(0, -dy), y1 = LV_MIN(MOTION_H, MOTION_H - dy);
+    uint32_t sum = 0;
+    for (int y = y0; y < y1; y++) {
+        const uint8_t *a = old + y * MOTION_W;
+        const uint8_t *b = cur + (y + dy) * MOTION_W + dx;
+        for (int x = x0; x < x1; x++) {
+            sum += abs(a[x] - b[x]);
+        }
+    }
+    return (uint32_t)((uint64_t)sum * 256 / ((x1 - x0) * (y1 - y0)));
+}
+
+static int rain_cells(const uint8_t *g)
+{
+    int n = 0;
+    for (int i = 0; i < MOTION_W * MOTION_H; i++) {
+        n += g[i] >= MOTION_CELL * MOTION_CELL / 4;
+    }
+    return n;
+}
+
+// Sub-cell offset of a minimum from its two neighbours (parabola through the three costs).
+static float parabola(uint32_t m, uint32_t c, uint32_t p)
+{
+    const float den = (float)m - 2.0f * c + (float)p;
+    return den > 0 ? 0.5f * ((float)m - (float)p) / den : 0;
+}
+
+static void estimate_motion(radar_ctx_t *c)
+{
+    uint8_t *old = heap_caps_malloc(2 * MOTION_W * MOTION_H, MALLOC_CAP_SPIRAM);
+    if (!old) {
+        return;
+    }
+    uint8_t *cur = old + MOTION_W * MOTION_H;
+    float dt_h = 0;
+    if (ui_lock()) {  // frames are freed under the lock when the screen closes
+        if (!c->cancel && c->past_count >= 2) {
+            const int newest = MAX_PAST - 1;
+            int k = newest - 1;
+            while (k > c->past_first && c->past_time[newest] - c->past_time[k] < MOTION_SPAN_S) {
+                k--;
+            }
+            dt_h = (float)(c->past_time[newest] - c->past_time[k]) / 3600.0f;
+            motion_grid(c->past[k], c->pal_rain, old);
+            motion_grid(c->past[newest], c->pal_rain, cur);
+        }
+        ui_unlock();
+    }
+    // Too little rain (or too short a span) gives a meaningless match.
+    if (dt_h < 0.3f || rain_cells(old) < 15 || rain_cells(cur) < 15) {
+        ESP_LOGI(TAG, "rain motion: not enough rain to track");
+        heap_caps_free(old);
+        return;
+    }
+    const int r = LV_CLAMP(2, (int)ceilf(MOTION_MAX_KMH * dt_h / (c->km_px * MOTION_CELL)), MOTION_MAX_R);
+    const int n = 2 * r + 1;
+    uint32_t *cost = heap_caps_malloc(n * n * sizeof(uint32_t), MALLOC_CAP_SPIRAM);  // [dy][dx]
+    if (!cost) {
+        heap_caps_free(old);
+        return;
+    }
+#define COST(dx, dy) cost[((dy) + r) * n + (dx) + r]
+    uint32_t best = UINT32_MAX;
+    int bx = 0, by = 0;
+    for (int dy = -r; dy <= r && !c->cancel; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            const uint32_t v = motion_cost(old, cur, dx, dy);
+            COST(dx, dy) = v;
+            // Ties go to the smaller shift (no rain moves is the safer answer).
+            if (v < best || (v == best && dx * dx + dy * dy < bx * bx + by * by)) {
+                best = v;
+                bx = dx;
+                by = dy;
+            }
+        }
+        vTaskDelay(1);
+    }
+    heap_caps_free(old);
+    if (c->cancel || abs(bx) == r || abs(by) == r) {
+        if (!c->cancel) {
+            ESP_LOGI(TAG, "rain motion: no match within %d km/h", (int)MOTION_MAX_KMH);
+        }
+        heap_caps_free(cost);
+        return;  // best match on the edge of the search: faster than we look for, or noise
+    }
+    const float fx = bx + parabola(COST(bx - 1, by), best, COST(bx + 1, by));
+    const float fy = by + parabola(COST(bx, by - 1), best, COST(bx, by + 1));
+#undef COST
+    heap_caps_free(cost);
+    const float vx = fx * MOTION_CELL / dt_h, vy = fy * MOTION_CELL / dt_h;
+    ESP_LOGI(TAG, "rain motion: %.0f km/h towards %.0f deg (span %.0f min, shift %d,%d)",
+             hypotf(vx, vy) * c->km_px, fmodf(atan2f(vx, -vy) * 180.0f / (float)M_PI + 360.0f, 360.0f),
+             dt_h * 60, bx, by);
+    if (ui_lock()) {
+        if (!c->cancel) {
+            c->rain_vx = vx;
+            c->rain_vy = vy;
+            c->motion_ok = true;
+            if (s_ctx == c) {
+                info_update(c);
+            }
+        }
+        ui_unlock();
+    }
 }
 
 // Runs on the network worker (one job at a time), so releasing the home rain map's buffers
@@ -691,6 +853,9 @@ static void loader_job(void *arg)
         load_radar(c, &http);
     }
     http_session_close(&http);
+    if (!c->cancel) {
+        estimate_motion(c);
+    }
 
     if (ui_lock()) {
         if (!c->cancel) {
@@ -707,6 +872,190 @@ static void loader_job(void *arg)
 
 // ---------------------------------------------------------------------------
 // UI
+
+static const char *compass8(float deg)
+{
+    static const char *const names[] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+    return names[(int)lroundf(fmodf(deg + 360.0f, 360.0f) / 45.0f) % 8];
+}
+
+// Car position in world pixels (MAP_Z): the live GPS fix, else where the map was opened.
+static void car_position(const radar_ctx_t *c, double *wx, double *wy)
+{
+    gps_fix_t f;
+    int sats;
+    if (gps_state(&sats) == GPS_FIX && gps_get(&f)) {
+        *wx = mt_lon_to_px(f.lon, MAP_Z);
+        *wy = mt_lat_to_px(f.lat, MAP_Z);
+    } else {
+        *wx = c->ox + MAP_W / 2;
+        *wy = c->oy + MAP_H / 2;
+    }
+}
+
+// Rain pixels in the newest radar frame within `r` px of (x, y) (frame pixels).
+static int rain_near(const radar_ctx_t *c, float x, float y, int r)
+{
+    const uint8_t *f = c->past[MAX_PAST - 1];
+    const int cx = (int)lroundf(x), cy = (int)lroundf(y);
+    int n = 0;
+    for (int yy = LV_MAX(0, cy - r); yy <= LV_MIN(RADAR_H - 1, cy + r); yy++) {
+        const uint8_t *row = f + (size_t)yy * RADAR_W;
+        for (int xx = LV_MAX(0, cx - r); xx <= LV_MIN(RADAR_W - 1, cx + r); xx++) {
+            n += c->pal_rain[row[xx]];
+        }
+    }
+    return n;
+}
+
+// Nearest rain pixel within NEAR_KM: distance (km) and bearing from the car, false if none.
+static bool rain_nearest(const radar_ctx_t *c, float x, float y, float *km, float *deg)
+{
+    const uint8_t *f = c->past[MAX_PAST - 1];
+    const int r = (int)(NEAR_KM / c->km_px), cx = (int)lroundf(x), cy = (int)lroundf(y);
+    int best = r * r + 1, bx = 0, by = 0;
+    for (int yy = LV_MAX(0, cy - r); yy <= LV_MIN(RADAR_H - 1, cy + r); yy++) {
+        const uint8_t *row = f + (size_t)yy * RADAR_W;
+        for (int xx = LV_MAX(0, cx - r); xx <= LV_MIN(RADAR_W - 1, cx + r); xx++) {
+            const int d = (xx - cx) * (xx - cx) + (yy - cy) * (yy - cy);
+            if (c->pal_rain[row[xx]] && d < best) {
+                best = d;
+                bx = xx - cx;
+                by = yy - cy;
+            }
+        }
+    }
+    if (best > r * r) {
+        return false;
+    }
+    *km = sqrtf((float)best) * c->km_px;
+    *deg = atan2f((float)bx, (float)-by) * 180.0f / (float)M_PI;
+    return true;
+}
+
+// The chip: rain ahead on the car's heading (or the nearest rain), and the rain's own motion.
+// Always from the newest radar frame, whatever the timeline shows.
+static void info_update(radar_ctx_t *c)
+{
+    if (c->past_count == 0 || !c->past[MAX_PAST - 1]) {
+        ui_set_hidden_if_changed(s_info, true);
+        return;
+    }
+    double wx, wy;
+    car_position(c, &wx, &wy);
+    const float ux = (float)(wx / 2 - (c->ox >> 1)), uy = (float)(wy / 2 - (c->oy >> 1));
+    const float heading = ui_gps_heading();
+    const int rr = LV_MAX(1, (int)lroundf(2.0f / c->km_px));  // ~2 km around a point
+    const bool here = rain_near(c, ux, uy, rr) >= 3;          // a few pixels: not a speck
+    float near_km = 0, near_deg = 0;
+    const bool near = !here && rain_nearest(c, ux, uy, &near_km, &near_deg);
+
+    char line[96];
+    int ahead = 0;
+    if (!here && heading >= 0) {
+        const float sn = sinf(heading * (float)M_PI / 180.0f), cs = cosf(heading * (float)M_PI / 180.0f);
+        for (int km = 2; km <= AHEAD_KM && !ahead; km += 2) {
+            const float d = km / c->km_px;
+            if (rain_near(c, ux + sn * d, uy - cs * d, rr) >= 3) {
+                ahead = km;
+            }
+        }
+    }
+    lv_color_t color = UI_COLOR_TEXT;
+    if (here) {
+        strlcpy(line, "Raining where you are", sizeof(line));
+        color = lv_color_hex(0x38BDF8);
+    } else if (ahead) {
+        snprintf(line, sizeof(line), "Rain %d km ahead", ahead);
+        color = UI_COLOR_WARN;
+    } else if (heading >= 0) {
+        if (near) {
+            snprintf(line, sizeof(line), "No rain ahead  ·  nearest %.0f km %s", near_km, compass8(near_deg));
+        } else {
+            strlcpy(line, "No rain ahead", sizeof(line));
+        }
+        color = UI_COLOR_OK;
+    } else if (near) {
+        snprintf(line, sizeof(line), "Nearest rain %.0f km %s", near_km, compass8(near_deg));
+    } else {
+        snprintf(line, sizeof(line), "No rain within %d km", NEAR_KM);
+        color = UI_COLOR_OK;
+    }
+    ui_label_set_text_if_changed(s_info_here, line);
+    if (!lv_color_eq(lv_obj_get_style_text_color(s_info_here, 0), color)) {
+        lv_obj_set_style_text_color(s_info_here, color, 0);
+    }
+
+    // Rain motion, and whether rain is coming this way: look upstream from the car (against the
+    // motion) for rain that the current motion would carry over it within ETA_MAX_H.
+    const float kmh = hypotf(c->rain_vx, c->rain_vy) * c->km_px;
+    lv_obj_t *row = lv_obj_get_parent(s_info_motion);
+    ui_set_hidden_if_changed(row, !c->motion_ok);
+    if (c->motion_ok) {
+        if (kmh < 5) {
+            strlcpy(line, "Rain almost stationary", sizeof(line));
+            ui_set_hidden_if_changed(s_info_arrow, true);
+        } else {
+            const float deg = atan2f(c->rain_vx, -c->rain_vy) * 180.0f / (float)M_PI;
+            char rel[32] = "";
+            if (!here) {
+                const float ux1 = c->rain_vx / hypotf(c->rain_vx, c->rain_vy);
+                const float uy1 = c->rain_vy / hypotf(c->rain_vx, c->rain_vy);
+                const int wide = LV_MAX(1, (int)lroundf(4.0f / c->km_px));  // rain can pass close by
+                const int max_km = (int)LV_MIN((float)NEAR_KM, kmh * ETA_MAX_H);
+                int up = 0;
+                for (int km = 2; km <= max_km && !up; km += 2) {
+                    const float d = km / c->km_px;
+                    if (rain_near(c, ux - ux1 * d, uy - uy1 * d, wide) >= 3) {
+                        up = km;
+                    }
+                }
+                if (up) {
+                    // It has moved on since the frame was taken.
+                    const int age = (int)((time(NULL) - c->past_time[MAX_PAST - 1]) / 60);
+                    const int eta = (int)lroundf(up / kmh * 60.0f) - age;
+                    if (eta < 10) {
+                        strlcpy(rel, "  ·  reaching you now", sizeof(rel));
+                    } else if (eta < 90) {
+                        snprintf(rel, sizeof(rel), "  ·  here in ~%d min", (eta + 5) / 10 * 10);
+                    } else {
+                        snprintf(rel, sizeof(rel), "  ·  here in ~%.0f h", eta / 60.0f);
+                    }
+                } else {
+                    strlcpy(rel, "  ·  not towards you", sizeof(rel));
+                }
+            }
+            snprintf(line, sizeof(line), "Rain moving %s at %.0f km/h%s", compass8(deg), kmh, rel);
+            ui_set_hidden_if_changed(s_info_arrow, false);
+            ui_heading_marker_set(s_info_arrow, fmodf(deg + 360.0f, 360.0f));
+        }
+        ui_label_set_text_if_changed(s_info_motion, line);
+    }
+    ui_set_hidden_if_changed(s_info, false);
+}
+
+// Car marker follows the GPS (the map itself stays put) and points along the course.
+static void follow_update(radar_ctx_t *c)
+{
+    double wx, wy;
+    car_position(c, &wx, &wy);
+    const int32_t half = lv_obj_get_width(s_you) / 2;
+    const int32_t x = (int32_t)lround(wx) - c->ox, y = (int32_t)lround(wy) - c->oy;
+    const bool in = x >= half && y >= half && x <= MAP_W - half && y <= MAP_H - half;
+    ui_set_hidden_if_changed(s_you, !in);
+    if (in && (lv_obj_get_x(s_you) != x - half || lv_obj_get_y(s_you) != UI_HEADER_H + y - half)) {
+        lv_obj_set_pos(s_you, x - half, UI_HEADER_H + y - half);
+    }
+    ui_heading_marker_set(s_you, ui_gps_heading());
+    info_update(c);
+}
+
+static void on_follow(lv_timer_t *t)
+{
+    if (s_ctx) {
+        follow_update(s_ctx);
+    }
+}
 
 static void set_playing(bool play)
 {
@@ -819,6 +1168,7 @@ void ui_radar_open(void)
     c->utc_offset = weather_utc_offset();
     c->ox = (int)lround(mt_lon_to_px(loc.lon, MAP_Z)) - MAP_W / 2;
     c->oy = (int)lround(mt_lat_to_px(loc.lat, MAP_Z)) - MAP_H / 2;
+    c->km_px = (float)(156543.03 * cos(loc.lat * M_PI / 180.0) / (1 << RADAR_Z) / 1000.0);
     s_ctx = c;
     s_frame = 0;
 
@@ -858,16 +1208,31 @@ void ui_radar_open(void)
         lv_obj_set_pos(m, px - 6, UI_HEADER_H + py - 6);
     }
 
-    // You-are-here marker
-    lv_obj_t *dot = lv_obj_create(scr);
-    lv_obj_remove_style_all(dot);
-    lv_obj_set_size(dot, 18, 18);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(dot, UI_COLOR_ACCENT, 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(dot, lv_color_white(), 0);
-    lv_obj_set_style_border_width(dot, 3, 0);
-    lv_obj_set_pos(dot, MAP_W / 2 - 9, UI_HEADER_H + MAP_H / 2 - 9);
+    // You-are-here marker: an arrow along the GPS course while driving (follow_update)
+    s_you = ui_heading_marker_create(scr, 40, UI_COLOR_ACCENT);
+    lv_obj_set_pos(s_you, MAP_W / 2 - 20, UI_HEADER_H + MAP_H / 2 - 20);
+
+    // Rain ahead / rain motion chip, filled once the newest radar frame is in
+    s_info = overlay_panel(scr);
+    lv_obj_set_size(s_info, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(s_info, 18, 0);
+    lv_obj_set_style_pad_ver(s_info, 10, 0);
+    lv_obj_set_style_pad_row(s_info, 4, 0);
+    lv_obj_set_flex_flow(s_info, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_pos(s_info, UI_PAD, UI_HEADER_H + UI_PAD);
+    lv_obj_set_clickable(s_info, false);
+    s_info_here = ui_label_create(s_info, ui_font_md, UI_COLOR_TEXT, "");
+    lv_obj_t *mrow = lv_obj_create(s_info);
+    lv_obj_remove_style_all(mrow);
+    lv_obj_set_size(mrow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(mrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(mrow, 8, 0);
+    lv_obj_set_clickable(mrow, false);
+    s_info_arrow = ui_heading_marker_create(mrow, 24, lv_color_hex(0x38BDF8));
+    s_info_motion = ui_label_create(mrow, ui_font_sm, UI_COLOR_MUTED, "");
+    lv_obj_set_hidden(mrow, true);
+    lv_obj_set_hidden(s_info, true);
 
     // Timeline panel
     lv_obj_t *bar = overlay_panel(scr);
@@ -910,14 +1275,16 @@ void ui_radar_open(void)
     lv_obj_set_size(s_status, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_pad_hor(s_status, 20, 0);
     lv_obj_set_style_pad_ver(s_status, 10, 0);
-    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, UI_HEADER_H + UI_PAD);
+    lv_obj_align(s_status, LV_ALIGN_TOP_RIGHT, -UI_PAD, UI_HEADER_H + UI_PAD);  // left: the info chip
     s_status_label = ui_label_create(s_status, ui_font_md, UI_COLOR_TEXT, "Loading map...");
 
     s_play_timer = lv_timer_create(on_play_tick, PLAY_MS, NULL);
     ui_screen_own_timer(scr, s_play_timer);
+    ui_screen_own_timer(scr, lv_timer_create(on_follow, FOLLOW_MS, NULL));
     set_playing(false);
     timeline_update();
     render();
+    follow_update(c);
     ui_screen_load(scr);
 
     if (wifi_mgr_state() != WIFI_MGR_CONNECTED) {

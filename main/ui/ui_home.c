@@ -31,6 +31,7 @@ extern const lv_image_dsc_t app_logo_small;
 #define GRID_H    (600 - TOP_Y - 24)
 #define ALERTS_W  226   // panel right of the clock
 #define ALERTS_H  156
+#define RAIN_YOU_SIZE 34   // car arrow on the rain map (the stopped dot is half that)
 #define GRID_COLS 3   // 3 columns; 2 rows fit, the grid scrolls to the rest
 #define CARD_GAP  12
 #define CARD_W    ((GRID_W - (GRID_COLS - 1) * CARD_GAP) / GRID_COLS)
@@ -77,6 +78,7 @@ static lv_obj_t *s_alerts;          // alerts panel body (right of the clock)
 static lv_obj_t *s_rain;            // live rain map card
 static lv_obj_t *s_rain_canvas;
 static lv_obj_t *s_rain_marks;      // marker layer over the canvas
+static lv_obj_t *s_rain_you;        // car marker on it (arrow while driving)
 static lv_obj_t *s_rain_tag;        // "RAIN RADAR · 18:00"
 static lv_obj_t *s_rain_caption;    // "No rain expected in the next 2 hours"
 static lv_obj_t *s_badge[APP_COUNT];
@@ -743,11 +745,36 @@ static void rain_mark(int32_t x, int32_t y, int32_t d, lv_color_t c, lv_color_t 
     lv_obj_set_clickable(m, false);
 }
 
+// You: the map is recentred only every 10 km (services/rain_now), so the marker is placed from
+// the current position, and points along the GPS course while driving (clock_update, 1 s).
+static void rain_you_update(void)
+{
+    if (!s_rain_you) {
+        return;
+    }
+    int32_t ox, oy;
+    rain_now_origin(&ox, &oy);
+    location_t loc;
+    int32_t yx = RAIN_NOW_W / 2, yy = RAIN_NOW_H / 2;
+    if (location_get(&loc)) {
+        const int32_t m = RAIN_YOU_SIZE / 2;
+        yx = LV_CLAMP(m, (int32_t)lround(mt_lon_to_px(loc.lon, RAIN_NOW_ZOOM)) - ox, RAIN_NOW_W - m);
+        yy = LV_CLAMP(m, (int32_t)lround(mt_lat_to_px(loc.lat, RAIN_NOW_ZOOM)) - oy, RAIN_NOW_H - m);
+    }
+    yx -= RAIN_YOU_SIZE / 2;
+    yy -= RAIN_YOU_SIZE / 2;
+    if (lv_obj_get_x(s_rain_you) != yx || lv_obj_get_y(s_rain_you) != yy) {
+        lv_obj_set_pos(s_rain_you, yx, yy);
+    }
+    ui_heading_marker_set(s_rain_you, ui_gps_heading());
+}
+
 static void fill_rain(void)
 {
     time_t radar_t = 0;
     const uint16_t *img = rain_now_image(&radar_t);
     lv_obj_clean(s_rain_marks);
+    s_rain_you = NULL;
     if (!img) {
         ui_set_hidden_if_changed(s_rain_canvas, true);
         ui_label_set_text_if_changed(s_rain_tag, "RAIN RADAR  ·  loading...");
@@ -766,15 +793,8 @@ static void fill_rain(void)
                   (int32_t)lround(mt_lat_to_px(inc[i].lat, RAIN_NOW_ZOOM)) - oy,
                   12, ui_traffic_color(inc[i].sev), lv_color_black());
     }
-    // You: the map is recentred only every 10 km (services/rain_now), so place the dot from the
-    // current position (refreshed every LOCATION_FOLLOW_MS, see on_follow).
-    location_t loc;
-    int32_t yx = RAIN_NOW_W / 2, yy = RAIN_NOW_H / 2;
-    if (location_get(&loc)) {
-        yx = LV_CLAMP(9, (int32_t)lround(mt_lon_to_px(loc.lon, RAIN_NOW_ZOOM)) - ox, RAIN_NOW_W - 9);
-        yy = LV_CLAMP(9, (int32_t)lround(mt_lat_to_px(loc.lat, RAIN_NOW_ZOOM)) - oy, RAIN_NOW_H - 9);
-    }
-    rain_mark(yx, yy, 18, UI_COLOR_ACCENT, lv_color_white());
+    s_rain_you = ui_heading_marker_create(s_rain_marks, RAIN_YOU_SIZE, UI_COLOR_ACCENT);
+    rain_you_update();
 
     char t[16], buf[48];
     if (radar_t) {
@@ -844,6 +864,7 @@ static void clock_update(lv_timer_t *t)
         ui_label_set_text_if_changed(s_date, buf);
     }
     update_subtitles();  // Wi-Fi state, fuel cache
+    rain_you_update();
 }
 
 // GPS-following refresh of what depends on the position but needs no network.
@@ -881,6 +902,7 @@ static void on_delete(lv_event_t *e)
     traffic_remove_listener(on_alerts, NULL);
     rain_now_remove_listener(on_rain_now, NULL);
     s_scr = NULL;
+    s_rain_you = NULL;
     ui_status_set_on_home(false);
 }
 
@@ -1088,31 +1110,51 @@ void ui_home_open(void)
 }
 
 // ---------------------------------------------------------------------------
-// Boot splash: a mountain landscape at dawn (tools/gen_logo.py, JPEG) with a compass whose
-// needle swings and settles on north, then the stencil "DashCar" word mark, while Wi-Fi joins the
-// saved network in the background.
+// Boot splash on a near-black background, while Wi-Fi joins the saved network in the background.
+// Two compositions (main/CMakeLists.txt picks the emblem file, tools/gen_logo.py makes both):
+//  - generic (ui/emblem.c, the DashCar "DC" monogram): an instrument-cluster ignition sequence. The
+//    tachometer's ticks light up, the needle sweeps to the red line and back, the monogram dashes in
+//    and gets a chrome shine, "DASHCAR" fades in below.
+//  - owner's build (ui/emblem_private.c, DASHCAR_EMBLEM_PRIVATE): the emblem's two halves slide in and
+//    lock together with a flash, a shine sweeps over it and a light bar opens under it.
 
 #define SPLASH_MIN_MS   2600                     // let the animation finish even on fast connects
-#define LOGO_COLOR      lv_color_hex(0xE8EEF2)
-#define DRL_COLOR       lv_color_hex(0x5EEAD4)   // "daytime running light" bar under the word mark
-#define NORTH_COLOR     lv_color_hex(0xEF4444)
-#define COMPASS_BOX     220
-#define COMPASS_D       196
-#define COMPASS_CY      175                      // compass centre, screen y
-#define WORD_CY         470                      // word mark centre, screen y (over the dark ridges)
-
-extern const lv_image_dsc_t app_logo_text;
-extern const lv_image_dsc_t app_compass_n;
-extern const lv_image_dsc_t app_compass_s;
-extern const uint8_t splash_jpg_start[] asm("_binary_splash_bg_jpg_start");
-extern const uint8_t splash_jpg_end[]   asm("_binary_splash_bg_jpg_end");
+#define EMBLEM_COLOR    lv_color_hex(0xB9C3CE)   // brushed metal; the shine sweeps white over it
+#define SHINE_W         120                      // widest of the three shine bands
+#if DASHCAR_EMBLEM_PRIVATE
+#define DRL_COLOR       lv_color_hex(0x5EEAD4)   // "daytime running light" bar under the emblem
+#define EMBLEM_W        600                      // emblem width, px
+#define EMBLEM_CY       280                      // emblem centre, screen y (a little above the middle)
+#define EMBLEM_SLIDE    240                      // each half starts this far out
+#define SNAP_AT         200                      // ms: halves start sliding in
+#define SNAP_MS         600                      // ...and lock together at SNAP_AT + SNAP_MS
+#else
+#define EMBLEM_W        290                      // monogram width, px (clear of the dial numbers)
+#define DIAL_CX         512
+#define DIAL_CY         290
+#define DIAL_R          238                      // outer arc radius
+#define DIAL_C          (DIAL_R + 12)            // centre inside the dial box (room for the needle tip)
+#define DIAL_TICKS      33                       // 8 majors (0..8, x1000 rpm) with 3 minors between
+#define DIAL_RED        27                       // first red-line tick (6.75)
+#define DIAL_START      135                      // degrees, LVGL style (clockwise from 3 o'clock)
+#define DIAL_SPAN       270
+#define TICK_DIM        lv_color_hex(0x263247)
+#define TICK_LIT        lv_color_hex(0xCBD5E1)
+#define TICK_RED        lv_color_hex(0xEF4444)
+#define SWEEP_COLOR     lv_color_hex(0x5EEAD4)
+#define NEEDLE_COLOR    lv_color_hex(0xFB923C)
+#endif
+extern const float app_emblem_pts[][2];          // emblem outlines (tools/gen_logo.py)
+extern const float app_emblem_w, app_emblem_h;
+extern const int app_emblem_contours;
+extern const int app_emblem_contour_end[];
 
 // Not in LVGL 9.6's public headers (src/misc/cache/instance/lv_image_cache.h), but exported. Needed
 // before freeing an image's pixels: the image cache keys entries by the descriptor's address.
 void lv_image_cache_drop(const void *src);
 
-static lv_image_dsc_t s_bg_dsc;   // decoded landscape (RGB565, PSRAM), freed with the splash
-static uint16_t *s_bg_px;
+static lv_image_dsc_t s_emblem_dsc;  // rasterised emblem (A8, PSRAM), freed with the splash
+static uint8_t *s_emblem_px;
 
 static lv_obj_t *s_splash;
 static lv_obj_t *s_splash_status;
@@ -1182,12 +1224,12 @@ static void on_splash_delete(lv_event_t *e)
         return;  // a newer instance of this screen already took over the shared state
     }
     wifi_mgr_remove_listener(on_splash_wifi, NULL);
-    if (s_bg_px) {
-        // The background image is deleted with the screen right after this, without another
-        // render, so the buffer can go now.
-        lv_image_cache_drop(&s_bg_dsc);
-        heap_caps_free(s_bg_px);
-        s_bg_px = NULL;
+    if (s_emblem_px) {
+        // The emblem images are deleted with the screen right after this, without another render,
+        // so the buffer can go now.
+        lv_image_cache_drop(&s_emblem_dsc);
+        heap_caps_free(s_emblem_px);
+        s_emblem_px = NULL;
     }
     if (s_splash_timer) {
         lv_timer_delete(s_splash_timer);
@@ -1196,85 +1238,166 @@ static void on_splash_delete(lv_event_t *e)
     s_splash = NULL;
 }
 
-static void anim_opa(void *obj, int32_t v)
+// Emblem outlines -> A8 coverage: even-odd scanline fill with 4 sub-rows per pixel and exact
+// horizontal coverage, so the edges are anti-aliased. ~100 KB, once per boot, a few ms.
+static bool emblem_rasterise(void)
 {
-    lv_obj_set_style_opa(obj, v, 0);
-}
-
-static lv_obj_t *s_needle[2];      // north, south halves (rotate together about the pivot)
-
-// Damped swing that settles exactly on north: v = 0..1000 over the animation.
-static void compass_swing(lv_anim_t *a, int32_t v)
-{
-    (void)a;
-    const float t = v / 1000.0f;
-    const float deg = -140.0f * expf(-3.5f * t) * cosf(2 * (float)M_PI * 1.75f * t) * (1 - t * t * t * t);
-    const int32_t rot = (int32_t)lroundf(deg * 10);
-    for (int i = 0; i < 2; i++) {
-        lv_image_set_rotation(s_needle[i], rot);
+    const float scale = EMBLEM_W / app_emblem_w;
+    const int w = EMBLEM_W, h = (int)lroundf(app_emblem_h * scale);
+    s_emblem_px = heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
+    float *cov = heap_caps_malloc((w + 1) * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!s_emblem_px || !cov) {
+        heap_caps_free(s_emblem_px);
+        heap_caps_free(cov);
+        s_emblem_px = NULL;
+        return false;
     }
+    for (int y = 0; y < h; y++) {
+        memset(cov, 0, (w + 1) * sizeof(float));
+        for (int sub = 0; sub < 4; sub++) {
+            const float sy = (y + (sub + 0.5f) / 4) / scale;  // outline units
+            float xs[16];
+            int nx = 0;
+            for (int c = 0, first = 0; c < app_emblem_contours; first = app_emblem_contour_end[c++]) {
+                const int last = app_emblem_contour_end[c] - 1;
+                for (int i = first; i <= last && nx < 16; i++) {
+                    const float *a = app_emblem_pts[i], *b = app_emblem_pts[i == last ? first : i + 1];
+                    if ((a[1] <= sy) != (b[1] <= sy)) {
+                        xs[nx++] = (a[0] + (sy - a[1]) * (b[0] - a[0]) / (b[1] - a[1])) * scale;
+                    }
+                }
+            }
+            for (int i = 1; i < nx; i++) {  // insertion sort, a handful of crossings
+                for (int j = i; j > 0 && xs[j - 1] > xs[j]; j--) {
+                    const float t = xs[j];
+                    xs[j] = xs[j - 1];
+                    xs[j - 1] = t;
+                }
+            }
+            for (int k = 0; k + 1 < nx; k += 2) {
+                const float x0 = LV_CLAMP(0, xs[k], w), x1 = LV_CLAMP(0, xs[k + 1], w);
+                const int i0 = (int)x0, i1 = (int)x1;
+                if (i0 == i1) {
+                    cov[i0] += x1 - x0;
+                    continue;
+                }
+                cov[i0] += i0 + 1 - x0;
+                for (int i = i0 + 1; i < i1; i++) {
+                    cov[i] += 1;
+                }
+                cov[i1] += x1 - i1;
+            }
+        }
+        for (int x = 0; x < w; x++) {
+            s_emblem_px[y * w + x] = (uint8_t)LV_MIN(255, (int)lroundf(cov[x] * (255.0f / 4)));
+        }
+    }
+    heap_caps_free(cov);
+    s_emblem_dsc = (lv_image_dsc_t){
+        .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_A8, .w = w, .h = h, .stride = w },
+        .data_size = (uint32_t)(w * h),
+        .data = s_emblem_px,
+    };
+    return true;
 }
 
-static lv_obj_t *compass_create(lv_obj_t *parent)
+// A clipping window `w` px wide onto the emblem, showing it from emblem x `sx` (the halves and the
+// shine bands are all windows onto the same image).
+static lv_obj_t *emblem_window(lv_obj_t *parent, int32_t sx, int32_t w, lv_color_t color)
 {
-    const int32_t c = COMPASS_BOX / 2;
     lv_obj_t *box = lv_obj_create(parent);
     lv_obj_remove_style_all(box);
-    lv_obj_set_size(box, COMPASS_BOX, COMPASS_BOX);
+    lv_obj_set_size(box, w, s_emblem_dsc.header.h);
     lv_obj_set_clickable(box, false);
     lv_obj_set_scrollable(box, false);
-
-    lv_obj_t *face = ring(box, c, c, COMPASS_D, 5, LOGO_COLOR, LV_OPA_COVER);
-    lv_obj_set_style_bg_color(face, lv_color_hex(0x0B1220), 0);
-    lv_obj_set_style_bg_opa(face, LV_OPA_70, 0);
-    ring(box, c, c, COMPASS_D - 52, 1, LOGO_COLOR, LV_OPA_30);
-
-    // 16 ticks, longer at the cardinal points (lv_line keeps the points pointer: static storage).
-    static lv_point_precise_t ticks[16][2];
-    for (int i = 0; i < 16; i++) {
-        const float a = i * (float)M_PI / 8;
-        const int32_t r0 = COMPASS_D / 2 - 8, len = i % 4 ? 7 : 15;
-        ticks[i][0] = (lv_point_precise_t){ c + r0 * sinf(a), c - r0 * cosf(a) };
-        ticks[i][1] = (lv_point_precise_t){ c + (r0 - len) * sinf(a), c - (r0 - len) * cosf(a) };
-        lv_obj_t *l = lv_line_create(box);
-        lv_line_set_points(l, ticks[i], 2);
-        lv_obj_set_style_line_width(l, i % 4 ? 2 : 4, 0);
-        lv_obj_set_style_line_rounded(l, true, 0);
-        lv_obj_set_style_line_color(l, LOGO_COLOR, 0);
-        lv_obj_set_style_line_opa(l, i % 4 ? LV_OPA_50 : LV_OPA_COVER, 0);
-        lv_obj_set_clickable(l, false);
-    }
-    static const char *const card[] = { "N", "E", "S", "W" };
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *l = ui_label_create(box, ui_font_md, i ? LOGO_COLOR : NORTH_COLOR, card[i]);
-        const float a = i * (float)M_PI / 2;
-        const int32_t r = COMPASS_D / 2 - 40;
-        lv_obj_align(l, LV_ALIGN_CENTER, (int32_t)lroundf(r * sinf(a)), (int32_t)lroundf(-r * cosf(a)));
-    }
-
-    // Needle: two A8 halves pivoting on the centre, tinted red (north) and light (south).
-    const int32_t nw = app_compass_n.header.w, nh = app_compass_n.header.h;
-    for (int i = 0; i < 2; i++) {
-        lv_obj_t *img = lv_image_create(box);
-        lv_image_set_src(img, i ? &app_compass_s : &app_compass_n);
-        lv_obj_set_style_image_recolor(img, i ? LOGO_COLOR : NORTH_COLOR, 0);
-        lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
-        lv_obj_set_pos(img, c - nw / 2, i ? c : c - nh);
-        lv_image_set_pivot(img, nw / 2, i ? 0 : nh);
-        s_needle[i] = img;
-    }
-    lv_obj_t *hub = shape(box, c - 8, c - 8, 16, 16, LV_RADIUS_CIRCLE, LOGO_COLOR);
-    lv_obj_set_style_border_color(hub, lv_color_hex(0x0B1220), 0);
-    lv_obj_set_style_border_width(hub, 3, 0);
-
-    compass_swing(NULL, 0);
+    lv_obj_t *img = lv_image_create(box);
+    lv_image_set_src(img, &s_emblem_dsc);
+    lv_obj_set_style_image_recolor(img, color, 0);
+    lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
+    lv_obj_set_pos(img, -sx, 0);
     return box;
 }
 
+static void anim_x(void *obj, int32_t v)
+{
+    lv_obj_set_x(obj, v);
+}
+
+// Image opacity of a window's emblem (no layer, unlike the object's own opa with children).
+static void anim_window_opa(void *obj, int32_t v)
+{
+    lv_obj_set_style_image_opa(lv_obj_get_child(obj, 0), v, 0);
+}
+
+static int32_t s_emblem_x;         // screen x of the assembled emblem
+static lv_obj_t *s_shine[3];
+
+// Shine: three nested bands (wide and faint .. narrow and bright) centred on v.
+static void shine_move(lv_anim_t *a, int32_t v)
+{
+    (void)a;
+    for (int i = 0; i < 3; i++) {
+        const int32_t x = v - lv_obj_get_width(s_shine[i]) / 2;
+        lv_obj_set_x(s_shine[i], x);
+        lv_obj_set_x(lv_obj_get_child(s_shine[i], 0), s_emblem_x - x);
+    }
+}
+
+#if DASHCAR_EMBLEM_PRIVATE
+static lv_obj_t *s_flare, *s_flash;
+
+// The lock flash: a horizontal flare opening out of the junction and a glow, quick in, slow out.
+static void flash_step(lv_anim_t *a, int32_t v)
+{
+    (void)a;
+    const int32_t opa = v < 120 ? v * 255 / 120 : (1000 - v) * 255 / 880;
+    const int32_t w = 40 + (int32_t)(860 * (1 - expf(-v / 180.0f)));
+    lv_obj_set_width(s_flare, w);
+    lv_obj_set_x(s_flare, 512 - w / 2);
+    lv_obj_set_style_bg_opa(s_flare, opa, 0);
+    lv_obj_set_style_shadow_opa(s_flare, opa, 0);
+    lv_obj_set_style_bg_opa(s_flash, opa, 0);
+    lv_obj_set_style_shadow_opa(s_flash, opa, 0);
+}
+
+static lv_obj_t *glow(lv_obj_t *parent, int32_t w, int32_t h, int32_t shadow)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(o, lv_color_white(), 0);
+    lv_obj_set_style_shadow_color(o, lv_color_hex(0xDDE7F0), 0);
+    lv_obj_set_style_shadow_width(o, shadow, 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_opa(o, LV_OPA_TRANSP, 0);
+    lv_obj_set_clickable(o, false);
+    return o;
+}
+
+#endif
+
+static void custom_anim(lv_obj_t *var, lv_anim_custom_exec_cb_t cb, int32_t from, int32_t to,
+                        uint32_t delay, uint32_t time, lv_anim_path_cb_t path)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, var);
+    lv_anim_set_custom_exec_cb(&a, cb);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_delay(&a, delay);
+    lv_anim_set_duration(&a, time);
+    lv_anim_set_path_cb(&a, path);
+    lv_anim_set_early_apply(&a, false);  // LVGL 9 applies `from` at start by default, even with a delay
+    lv_anim_start(&a);
+}
+
+#if DASHCAR_EMBLEM_PRIVATE
 static void anim_width(void *obj, int32_t v)
 {
     lv_obj_set_width(obj, v);
 }
+#endif
 
 static void animate(lv_obj_t *obj, lv_anim_exec_xcb_t cb, int32_t from, int32_t to,
                     uint32_t delay, uint32_t time, lv_anim_path_cb_t path)
@@ -1291,53 +1414,45 @@ static void animate(lv_obj_t *obj, lv_anim_exec_xcb_t cb, int32_t from, int32_t 
     lv_anim_start(&a);
 }
 
-void ui_splash_open(void)
+#if !DASHCAR_EMBLEM_PRIVATE
+static void anim_label_opa(void *obj, int32_t v)
 {
-    char ssid[SETTINGS_SSID_MAX], pass[SETTINGS_PASS_MAX];
-    bool have_creds = settings_get_wifi(ssid, pass);
+    lv_obj_set_style_opa(obj, v, 0);
+}
+#endif
 
-    lv_obj_t *scr = ui_screen_create();
-    s_splash = scr;
-    s_splash_min_done = false;
-    s_splash_connected = false;
-    lv_obj_add_event_cb(scr, on_splash_delete, LV_EVENT_DELETE, NULL);
-    // Subtle vertical gradient towards black, like a dark dashboard at night.
-    lv_obj_set_style_bg_grad_color(scr, lv_color_black(), 0);
-    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
-
-    // Landscape (~35 KB JPEG -> 1.2 MB RGB565 in PSRAM while the splash shows).
-    int bw, bh;
-    if (!s_bg_px && map_tiles_decode_jpeg_rgb565(splash_jpg_start, splash_jpg_end - splash_jpg_start, &s_bg_px,
-                                                 &bw, &bh) == ESP_OK) {
-        s_bg_dsc = (lv_image_dsc_t){
-            .header = { .magic = LV_IMAGE_HEADER_MAGIC, .cf = LV_COLOR_FORMAT_RGB565, .w = bw, .h = bh,
-                        .stride = bw * 2 },
-            .data_size = bw * bh * 2,
-            .data = (const uint8_t *)s_bg_px,
-        };
+// Three nested shine bands over the emblem at screen y `ey`, parked left of it.
+static void shine_create(lv_obj_t *scr, int32_t ey)
+{
+    static const int32_t band_w[3] = { SHINE_W, SHINE_W / 2, SHINE_W / 5 };
+    static const lv_opa_t band_opa[3] = { 70, 110, 255 };
+    for (int i = 0; i < 3; i++) {
+        s_shine[i] = emblem_window(scr, 0, band_w[i], lv_color_white());
+        lv_obj_set_y(s_shine[i], ey);
+        lv_obj_set_style_image_opa(lv_obj_get_child(s_shine[i], 0), band_opa[i], 0);
     }
-    if (s_bg_px) {
-        lv_obj_t *bg = lv_image_create(scr);
-        lv_image_set_src(bg, &s_bg_dsc);
-        lv_obj_set_pos(bg, 0, 0);
+    shine_move(NULL, s_emblem_x - SHINE_W);
+}
+
+#if DASHCAR_EMBLEM_PRIVATE
+// Owner's build: the emblem's halves slide in and lock with a flash, shine, light bar.
+static void splash_emblem_lock(lv_obj_t *scr)
+{
+    // Emblem: the two halves (split at the pinch in the middle), shine bands over them, flash.
+    lv_obj_t *half[2] = { NULL, NULL };
+    if (s_emblem_px || emblem_rasterise()) {
+        const int32_t eh = s_emblem_dsc.header.h, split = EMBLEM_W / 2, ey = EMBLEM_CY - eh / 2;
+        s_emblem_x = (1024 - EMBLEM_W) / 2;
+        half[0] = emblem_window(scr, 0, split, EMBLEM_COLOR);
+        half[1] = emblem_window(scr, split, EMBLEM_W - split, EMBLEM_COLOR);
+        lv_obj_set_y(half[0], ey);
+        lv_obj_set_y(half[1], ey);
+        shine_create(scr, ey);
+        s_flare = glow(scr, 40, 4, 30);
+        lv_obj_set_y(s_flare, EMBLEM_CY - 2);
+        s_flash = glow(scr, 30, 30, 90);
+        lv_obj_set_pos(s_flash, 512 - 15, EMBLEM_CY - 15);
     }
-
-    lv_obj_t *compass = compass_create(scr);
-    lv_obj_set_pos(compass, (1024 - COMPASS_BOX) / 2, COMPASS_CY - COMPASS_BOX / 2);
-
-    // Word mark, revealed left to right by growing a clipping box around it (like a spray stencil).
-    const int32_t ww = app_logo_text.header.w, wh = app_logo_text.header.h;
-    lv_obj_t *word = lv_obj_create(scr);
-    lv_obj_remove_style_all(word);
-    lv_obj_set_size(word, 0, wh);
-    lv_obj_set_pos(word, (1024 - ww) / 2, WORD_CY - wh / 2);
-    lv_obj_set_clickable(word, false);
-    lv_obj_set_scrollable(word, false);
-    lv_obj_t *img = lv_image_create(word);
-    lv_image_set_src(img, &app_logo_text);
-    lv_obj_set_style_image_recolor(img, LOGO_COLOR, 0);
-    lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
-    lv_obj_set_pos(img, 0, 0);
 
     lv_obj_t *drl = lv_obj_create(scr);
     lv_obj_remove_style_all(drl);
@@ -1348,7 +1463,188 @@ void ui_splash_open(void)
     lv_obj_set_style_shadow_color(drl, DRL_COLOR, 0);
     lv_obj_set_style_shadow_width(drl, 24, 0);
     lv_obj_set_style_shadow_opa(drl, LV_OPA_70, 0);
-    lv_obj_align(drl, LV_ALIGN_TOP_MID, 0, WORD_CY + wh / 2 + 16);
+    lv_obj_align(drl, LV_ALIGN_TOP_MID, 0, EMBLEM_CY + (int32_t)(app_emblem_h * EMBLEM_W / app_emblem_w) / 2 + 48);
+
+    // The halves fade in while sliding together, accelerating like magnets, and lock with a flash;
+    // a shine sweeps over the emblem and the light bar opens under it.
+    if (half[0]) {
+        for (int i = 0; i < 2; i++) {
+            const int32_t x = s_emblem_x + (i ? EMBLEM_W / 2 : 0);
+            animate(half[i], anim_x, x + (i ? EMBLEM_SLIDE : -EMBLEM_SLIDE), x, SNAP_AT, SNAP_MS, lv_anim_path_ease_in);
+            animate(half[i], anim_window_opa, 0, 255, SNAP_AT, SNAP_MS * 2 / 3, lv_anim_path_linear);
+        }
+        custom_anim(s_flash, flash_step, 0, 1000, SNAP_AT + SNAP_MS, 650, lv_anim_path_linear);
+        custom_anim(s_shine[0], shine_move, s_emblem_x - SHINE_W, s_emblem_x + EMBLEM_W + SHINE_W,
+                    SNAP_AT + SNAP_MS + 250, 700, lv_anim_path_ease_in_out);
+    }
+    animate(drl, anim_width, 0, EMBLEM_W - 40, SNAP_AT + SNAP_MS + 400, 700, lv_anim_path_ease_in_out);
+
+}
+#else
+// Generic: tachometer ignition sequence around the DashCar monogram.
+static lv_obj_t *s_tick[DIAL_TICKS];
+static lv_obj_t *s_tick_label[DIAL_TICKS / 4 + 1];
+static uint8_t s_tick_state[DIAL_TICKS];   // 0 dim, 1 lit, 2 under the sweep
+static lv_obj_t *s_dial_arc, *s_needle;
+
+static float dial_angle(float frac)        // radians, LVGL orientation (y down)
+{
+    return (DIAL_START + DIAL_SPAN * frac) * (float)M_PI / 180.0f;
+}
+
+static void tick_set(int i, uint8_t state)
+{
+    if (s_tick_state[i] == state) {
+        return;  // style changes redraw: only on a real change
+    }
+    s_tick_state[i] = state;
+    lv_color_t c = state == 0 ? TICK_DIM : i >= DIAL_RED ? TICK_RED : state == 2 ? SWEEP_COLOR : TICK_LIT;
+    lv_obj_set_style_line_color(s_tick[i], c, 0);
+    lv_obj_set_style_line_opa(s_tick[i], state == 0 ? LV_OPA_60 : LV_OPA_COVER, 0);
+    if (i % 4 == 0) {
+        lv_obj_set_style_opa(s_tick_label[i / 4], state ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+}
+
+// Ticks light up one after another around the dial; v = number lit.
+static void dial_light(lv_anim_t *a, int32_t v)
+{
+    (void)a;
+    for (int i = 0; i < DIAL_TICKS; i++) {
+        tick_set(i, i < v ? 1 : 0);
+    }
+}
+
+// Needle position v = 0..1000 (0 rpm .. the end of the scale): arc fill, needle, ticks under it.
+static void dial_sweep(lv_anim_t *a, int32_t v)
+{
+    (void)a;
+    lv_arc_set_value(s_dial_arc, v);
+    const float ang = dial_angle(v / 1000.0f);
+    static lv_point_precise_t pts[2];  // lv_line keeps the pointer
+    pts[0] = (lv_point_precise_t){ DIAL_C + (DIAL_R - 56) * cosf(ang), DIAL_C + (DIAL_R - 56) * sinf(ang) };
+    pts[1] = (lv_point_precise_t){ DIAL_C + (DIAL_R + 6) * cosf(ang), DIAL_C + (DIAL_R + 6) * sinf(ang) };
+    lv_line_set_points(s_needle, pts, 2);
+    const int under = (int)lroundf(v / 1000.0f * (DIAL_TICKS - 1));
+    for (int i = 0; i < DIAL_TICKS; i++) {
+        tick_set(i, i <= under && v > 0 ? 2 : 1);
+    }
+}
+
+static void splash_ignition(lv_obj_t *scr)
+{
+    // Everything dial-related lives in a box of the dial's size, so its points are local.
+    lv_obj_t *dial = lv_obj_create(scr);
+    lv_obj_remove_style_all(dial);
+    lv_obj_set_size(dial, 2 * DIAL_C, 2 * DIAL_C);
+    lv_obj_set_pos(dial, DIAL_CX - DIAL_C, DIAL_CY - DIAL_C);
+    lv_obj_set_clickable(dial, false);
+    lv_obj_set_scrollable(dial, false);
+
+    // Track + sweep: an arc with the needle's value; the track itself draws in first.
+    s_dial_arc = lv_arc_create(dial);
+    lv_obj_set_size(s_dial_arc, 2 * DIAL_R, 2 * DIAL_R);
+    lv_obj_center(s_dial_arc);
+    lv_obj_remove_style(s_dial_arc, NULL, LV_PART_KNOB);
+    lv_obj_set_clickable(s_dial_arc, false);
+    lv_arc_set_rotation(s_dial_arc, DIAL_START);
+    lv_arc_set_bg_angles(s_dial_arc, 0, DIAL_SPAN);
+    lv_arc_set_range(s_dial_arc, 0, 1000);
+    lv_arc_set_value(s_dial_arc, 0);
+    lv_obj_set_style_arc_width(s_dial_arc, 4, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_dial_arc, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_dial_arc, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_dial_arc, SWEEP_COLOR, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(s_dial_arc, LV_OPA_60, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_all(s_dial_arc, 0, 0);
+
+    // Ticks (majors longer, with the numbers inside), dim until lit.
+    static lv_point_precise_t tick_pts[DIAL_TICKS][2];
+    for (int i = 0; i < DIAL_TICKS; i++) {
+        const bool major = i % 4 == 0;
+        const float ang = dial_angle((float)i / (DIAL_TICKS - 1));
+        const float r0 = DIAL_R - 16, r1 = DIAL_R - (major ? 42 : 28);
+        tick_pts[i][0] = (lv_point_precise_t){ DIAL_C + r0 * cosf(ang), DIAL_C + r0 * sinf(ang) };
+        tick_pts[i][1] = (lv_point_precise_t){ DIAL_C + r1 * cosf(ang), DIAL_C + r1 * sinf(ang) };
+        s_tick[i] = lv_line_create(dial);
+        lv_line_set_points(s_tick[i], tick_pts[i], 2);
+        lv_obj_set_style_line_width(s_tick[i], major ? 5 : 3, 0);
+        lv_obj_set_style_line_rounded(s_tick[i], true, 0);
+        lv_obj_set_clickable(s_tick[i], false);
+        if (major) {
+            char num[4];
+            snprintf(num, sizeof(num), "%d", i / 4);
+            lv_obj_t *l = ui_label_create(dial, ui_font_md, i >= DIAL_RED ? TICK_RED : UI_COLOR_MUTED, num);
+            const float rl = DIAL_R - 66;
+            lv_obj_align(l, LV_ALIGN_CENTER, (int32_t)lroundf(rl * cosf(ang)), (int32_t)lroundf(rl * sinf(ang)));
+            s_tick_label[i / 4] = l;
+        }
+        s_tick_state[i] = 0xFF;
+        tick_set(i, 0);
+    }
+
+    // Needle: a bright bar across the arc (the centre stays free for the monogram).
+    s_needle = lv_line_create(dial);
+    lv_obj_set_style_line_width(s_needle, 6, 0);
+    lv_obj_set_style_line_rounded(s_needle, true, 0);
+    lv_obj_set_style_line_color(s_needle, NEEDLE_COLOR, 0);
+    lv_obj_set_clickable(s_needle, false);
+    dial_sweep(NULL, 0);
+    for (int i = 0; i < DIAL_TICKS; i++) {
+        tick_set(i, 0);
+    }
+
+    lv_obj_t *rpm = ui_label_create(dial, ui_font_sm, UI_COLOR_MUTED, "x1000 rpm");
+    lv_obj_align(rpm, LV_ALIGN_CENTER, 0, -DIAL_R / 2 - 4);
+    lv_obj_set_style_opa(rpm, LV_OPA_TRANSP, 0);
+
+    // Monogram in the middle, dashing in from the left; shine bands over it.
+    lv_obj_t *mono = NULL;
+    if (s_emblem_px || emblem_rasterise()) {
+        const int32_t eh = s_emblem_dsc.header.h, ey = DIAL_CY - eh / 2 + 6;
+        s_emblem_x = DIAL_CX - EMBLEM_W / 2;
+        mono = emblem_window(scr, 0, EMBLEM_W, EMBLEM_COLOR);
+        lv_obj_set_y(mono, ey);
+        shine_create(scr, ey);
+    }
+    lv_obj_t *word = ui_label_create(scr, ui_font_md, UI_COLOR_MUTED, "D A S H C A R");
+    lv_obj_set_style_text_letter_space(word, 6, 0);
+    lv_obj_align(word, LV_ALIGN_TOP_MID, 0, DIAL_CY + DIAL_R / 2 + 34);
+
+    // 0-0.6 s ticks light up; 0.55-1.2 s sweep to the end of the scale, 1.2-1.85 s back to 0;
+    // 1.25-1.85 s the monogram dashes in; 1.9 s shine; "DASHCAR" fades in.
+    custom_anim(dial, dial_light, 0, DIAL_TICKS, 60, 560, lv_anim_path_linear);
+    animate(rpm, anim_label_opa, 0, 255, 300, 400, lv_anim_path_linear);
+    custom_anim(s_dial_arc, dial_sweep, 0, 1000, 550, 650, lv_anim_path_ease_in_out);
+    custom_anim(s_needle, dial_sweep, 1000, 0, 1200, 650, lv_anim_path_ease_in_out);
+    if (mono) {
+        animate(mono, anim_x, s_emblem_x - 120, s_emblem_x, 1250, 600, lv_anim_path_ease_out);
+        animate(mono, anim_window_opa, 0, 255, 1250, 350, lv_anim_path_linear);
+        custom_anim(s_shine[0], shine_move, s_emblem_x - SHINE_W, s_emblem_x + EMBLEM_W + SHINE_W,
+                    1900, 600, lv_anim_path_ease_in_out);
+    }
+    animate(word, anim_label_opa, 0, 255, 1700, 500, lv_anim_path_linear);
+}
+#endif
+
+void ui_splash_open(void)
+{
+    char ssid[SETTINGS_SSID_MAX], pass[SETTINGS_PASS_MAX];
+    bool have_creds = settings_get_wifi(ssid, pass);
+
+    lv_obj_t *scr = ui_screen_create();
+    s_splash = scr;
+    s_splash_min_done = false;
+    s_splash_connected = false;
+    lv_obj_add_event_cb(scr, on_splash_delete, LV_EVENT_DELETE, NULL);
+    // Plain near-black: a gradient bands visibly on the RGB565 panel.
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x05080E), 0);
+
+#if DASHCAR_EMBLEM_PRIVATE
+    splash_emblem_lock(scr);
+#else
+    splash_ignition(scr);
+#endif
 
     // Status row, revealed only if Wi-Fi is still joining once the animation is over.
     s_splash_status = lv_obj_create(scr);
@@ -1365,20 +1661,6 @@ void ui_splash_open(void)
     ui_label_create(s_splash_status, ui_font_md, UI_COLOR_MUTED, buf);
     ui_button_create(s_splash_status, LV_SYMBOL_SETTINGS "  Wi-Fi setup", UI_COLOR_CARD_HI, on_splash_setup, NULL);
     lv_obj_set_hidden(s_splash_status, true);
-
-    // Compass fades in and its needle swings, settling on north; then the word mark is sprayed
-    // on left to right and the light bar opens under it.
-    animate(compass, anim_opa, 0, 255, 100, 500, lv_anim_path_ease_out);
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, compass);
-    lv_anim_set_custom_exec_cb(&a, compass_swing);
-    lv_anim_set_values(&a, 0, 1000);
-    lv_anim_set_delay(&a, 250);
-    lv_anim_set_duration(&a, 2100);
-    lv_anim_start(&a);
-    animate(word, anim_width, 0, ww, 1200, 600, lv_anim_path_ease_out);
-    animate(drl, anim_width, 0, 560, 1500, 600, lv_anim_path_ease_in_out);
 
     s_splash_timer = lv_timer_create(on_splash_timer, SPLASH_MIN_MS, NULL);
     lv_timer_set_repeat_count(s_splash_timer, 1);

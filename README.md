@@ -18,9 +18,9 @@ a phone hotspot.
 
 | Screen | What it does |
 |---|---|
-| **Boot splash** | Mountain landscape at dawn with a compass whose needle swings and settles on north, then "DashCar" in a military stencil face sprayed on left to right with a light bar, ≥ 2.6 s while Wi-Fi joins in the background. |
+| **Boot splash** | Instrument-cluster ignition on a dark background: a tachometer's ticks light up, the needle sweeps to the red line and back with a glowing arc, the italic "DC" monogram (its D trailing into speed streaks) dashes in with a chrome shine, "DASHCAR" fades in below; ≥ 2.6 s while Wi-Fi joins in the background. A private emblem can replace it in your own build (see `tools/gen_logo.py`: `--dacia` makes a git-ignored `ui/emblem_private.c`, used automatically, with a "halves lock together" animation). |
 | **Wi-Fi setup** | Scan list + SSID/password form on the on-screen keyboard. Saved in NVS after a successful connection. |
-| **Home** | Clock; **Alerts** panel next to it (AEMET warnings first, then major traffic nearby; tap: popup with both, traffic rows open the incident + Maps QR, "Open Traffic"); **live rain map** of ~50 km around the car (latest radar frame, your position, incident dots, "No rain expected in the next 2 hours"; tap for the full Radar); app cards with live subtitles (Weather, Radar, Traffic / Fuel, GPS, Trip; scroll the cards up for Explore, Cameras, Parked, then Settings; dots show the position). The **Fuel card shows a QR to the nearest station** (Google Maps directions) with brand, price and distance from where the car is now; the Parked card shows a "P" sign icon, how long ago you parked and, with a GPS fix, how far away the car is. |
+| **Home** | Clock; **Alerts** panel next to it (AEMET warnings first, then major traffic nearby; tap: popup with both, traffic rows open the incident + Maps QR, "Open Traffic"); **live rain map** of ~50 km around the car (latest radar frame, your position as an arrow along the GPS course while driving, incident dots, "No rain expected in the next 2 hours"; tap for the full Radar); app cards with live subtitles (Weather, Radar, Traffic / Fuel, GPS, Trip; scroll the cards up for Explore, Cameras, Parked, then Settings; dots show the position). The **Fuel card shows a QR to the nearest station** (Google Maps directions) with brand, price and distance from where the car is now; the Parked card shows a "P" sign icon, how long ago you parked and, with a GPS fix, how far away the car is. |
 | **GPS** | Live speed (huge), heading, latitude/longitude, altitude, satellites and fix accuracy (HDOP). The status bar shows the satellite count next to Wi-Fi (green = fix, amber = searching). |
 | **Trip** | Trip computer from the GPS: distance, driving time, average and top speed, stopped time; today, this month, previous trip and a GPS odometer. A trip starts when the car moves and ends after 2 h without moving (or "New trip"). Speeds under 5 km/h count as stopped (GPS noise), and 3 consecutive moving fixes are needed before distance counts. Saved to flash every 2 min and at every stop. |
 | **Speed cameras** | DGT list of 690 fixed cameras and 47 average-speed sections (not Catalonia / Basque Country), downloaded weekly and kept in flash, so it works offline. On any screen: a **red banner** ~30 s before a fixed camera ahead (bearing within 30° of your course), an **amber banner** inside an average-speed section with your running average and the distance to the end, then your final average. Screen: alerts on/off and the nearest 20 cameras. |
@@ -30,7 +30,7 @@ a phone hotspot.
 | **Where I parked** | Big QR with Google Maps walking directions back to the car, spot details and age. The GPS saves the spot after a 90 s stop that follows driving; until the first one it shows a hardcoded demo spot. |
 | **Traffic (Spain)** | DGT live incidents (accidents, closures, queues, broken-down vehicles, roadworks...) within 25/50/100 km, Major/All filter, severity colours, detail popup with a Maps QR; dots on the radar maps. |
 | **Weather** | Current conditions, 15-min "Next 2 hours" rain chart, 24 h strip, 7-day forecast. °C/°F. Location by IP or city search. |
-| **Radar** | Dark map with the last 2 h of real radar plus 12 h of forecast rain and clouds on one timeline (play/scrub, Rain/Clouds toggles). |
+| **Radar** | Dark map with the last 2 h of real radar plus 12 h of forecast rain and clouds on one timeline (play/scrub, Rain/Clouds toggles). The car is an **arrow along the GPS course** (moves with the car; a dot when stopped for > 2 min or without a fix). A chip says **"Rain 20 km ahead" / "No rain ahead"** (40 km along the heading; stopped: nearest rain) and **which way the rain is moving** (block matching of the newest radar frame against the one ~1 h older), with "here in ~N min" when rain is upstream of the car. Weak translucent echoes (drizzle aloft, clutter) don't count as rain. |
 | **Settings** | Wi-Fi, night mode (Auto/On/Off), units, wireless updates (version, slot, on/off), clock/RTC status, data sources. |
 | **Fuel (Spain)** | Nearby stations and prices for Diésel / 95 / 98 / Diésel+ / GLP within 5/10/25 km; cheapest/nearest/average; list by price or distance; station popup with a **QR code** that opens Google Maps navigation on your phone. |
 
@@ -149,12 +149,13 @@ main/
   services/ext_rtc.[ch] PCF85063A RTC (named ext_rtc_*: IDF already has rtc_init)
   services/ota.[ch]     HTTP update server, image check, mDNS, rollback confirmation
   ui/ui.[ch]            fonts (Tiny TTF), theme, status bar (home button), header (big back + swipe),
-                        night overlay, OTA progress overlay, card/list/toast helpers
+                        night overlay, OTA progress overlay, card/list/toast helpers,
+                        heading marker (map arrow/dot) + `ui_gps_heading()`
   ui/ui_home.c          home screen (+ warning pill/popup) and boot splash
   ui/ui_settings.c      settings screen
   ui/ui_wifi.c          Wi-Fi setup screen
   ui/app_weather.c      weather screen + city search
-  ui/app_radar.c        radar map: loader task, compositor, timeline
+  ui/app_radar.c        radar map: loader task, compositor, timeline, car arrow, rain ahead + rain motion
   ui/app_fuel.c         fuel screen, station popup with QR
   ui/app_traffic.c      traffic screen, incident popup with QR
   ui/app_parking.c      "Where I parked" screen (walking-directions QR)
@@ -165,15 +166,15 @@ main/
   ui/cam_alert.c        speed camera / average-speed section banner on the top layer (1 s check)
   ui/touch_input.[ch]   buffered touch: 10 ms polling task + LVGL replay (no lost taps/swipes while rendering)
   ui/wx_icon.[ch]       weather icons drawn from LVGL primitives (any size)
-  ui/app_logo.c         GENERATED by tools/gen_logo.py (A8 bitmaps: home icon, stencil word mark, compass needle)
-  ui/splash_bg.jpg      GENERATED by tools/gen_logo.py (splash landscape, ~33 KB, embedded)
+  ui/app_logo.c         GENERATED by tools/gen_logo.py (A8 home header icon)
+  ui/emblem.c           GENERATED by tools/gen_logo.py (splash "DC" monogram outlines, rasterised at boot)
+  ui/emblem_private.c   optional, git-ignored (gen_logo.py --dacia): owner's emblem; switches the splash composition
   debug/screenshot.[ch] dbg_screenshot(): dump the screen over serial (see tools/devcap.py)
   debug/touch_sim.[ch]  virtual finger: dbg_touch_tap() / dbg_touch_swipe() through the real input queue
   debug/selftest.[ch]   scripted touch stress test (only built by tools/selftest.sh)
   fonts/                Montserrat Medium/SemiBold, Latin subset (OFL)
 tools/
-  gen_logo.py           regenerate ui/app_logo.c + ui/splash_bg.jpg (original artwork; Black Ops One font in tools/fonts)
-  fonts/                Black Ops One (SIL OFL), used only by gen_logo.py
+  gen_logo.py           regenerate ui/app_logo.c + ui/emblem.c [+ ui/emblem_private.c with --dacia]
   devcap.py             reset board, stream logs, save DUMP screenshots as PNG (+ QR decode)
   ota.sh                upload build/dashcar.bin over Wi-Fi (default host dashcar.local)
   soak.sh               ~35 min realistic workload test (simulated drive + ghost user + monitor), see CLAUDE.md
@@ -255,9 +256,9 @@ Details and quirks of each API: `ESP32-info.md` §8.
 
 ## Credits and licences
 
-- Montserrat font: SIL Open Font License (`main/fonts/OFL.txt`). Black Ops One (splash word mark, rendered to a
-  bitmap): SIL Open Font License (`tools/fonts/OFL-BlackOpsOne.txt`).
+- Montserrat font: SIL Open Font License (`main/fonts/OFL.txt`).
 - Map data: Esri, HERE, Garmin, © OpenStreetMap contributors (speed limits: OpenStreetMap, ODbL). Radar: RainViewer. Weather: Open-Meteo (CC BY 4.0), MET Norway (CC BY 4.0).
   Fuel prices: Ministerio para la Transición Ecológica (Spain). Warnings: AEMET via MeteoAlarm (CC BY 4.0).
   Speed cameras: DGT (NAP, CC BY). Places (Explore) and speed limits: © OpenStreetMap contributors (ODbL).
-- The DashCar emblem, splash landscape and compass are original artwork (`tools/gen_logo.py`).
+- The DashCar header icon and "DC" monogram are original artwork (`tools/gen_logo.py`). The optional `--dacia`
+  emblem is a trademark of Dacia / Renault Group: it is never committed (git-ignored); keep such builds to your own car.

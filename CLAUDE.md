@@ -104,7 +104,8 @@ from a shell whose own command line contains that string (it kills itself).
 - **HTTP:** URLs over ~2 KB need a bigger `buffer_size_tx`. Many tiles to one host: use `http_session_get()`.
   When evaluating a tile or image provider, **check the pixels**: CARTO returns 200 with an "API KEY REQUIRED"
   image, and RainViewer returns a "Zoom Level Not Supported" image above z7.
-- **Generated files:** `ui/app_logo.c` + `ui/splash_bg.jpg` (`tools/gen_logo.py`) and `services/warn_zones.c` (`tools/gen_zones.py`).
+- **Generated files:** `ui/app_logo.c`, `ui/emblem.c` (+ git-ignored `ui/emblem_private.c` with `--dacia`) from
+  `tools/gen_logo.py`, and `services/warn_zones.c` (`tools/gen_zones.py`).
   Don't hand-edit them.
 - **Navigation:** every non-home screen uses `ui_header_create(scr, title, on_back)`, which gives the big back
   button plus swipe-right-to-go-back. The status bar is the home button. Keep touch targets ≥ 48 px.
@@ -194,8 +195,32 @@ from a shell whose own command line contains that string (it kills itself).
   (The Fuel card QR to the nearest station was an explicit earlier request.)
 - Sends messages mid-task; answer them as you go.
 
-## Status (2026-10-14) and ideas
+## Status (2026-10-18) and ideas
 
+Done (2026-10-18): two splash compositions. **Generic (repo default, `ui/emblem.c`)**: tachometer ignition: ticks
+light up, needle sweeps to the red line and back (arc + ticks follow it), italic "DC" monogram with speed streaks
+dashes in + shine, "D A S H C A R" below. The user rejected a plain "DC" as too simple ("be more creative").
+**Owner's build**: the Dacia emblem below, from the git-ignored `ui/emblem_private.c` (`gen_logo.py --dacia`),
+picked by CMake (`DASHCAR_EMBLEM_PRIVATE`); the user wants it kept for themselves only. Run `idf.py reconfigure`
+after adding/removing that file. Verified: generic variant on the device (frames 400/950/1500/2500 ms, separate
+build dir with the private file moved away), owner's build flashed and booting.
+Done (2026-10-18): splash = Dacia "Link" emblem (2021+ "DC", the user's car brand) on a plain near-black background:
+halves slide in and lock with a flare + glow, a 3-band chrome shine sweeps over it, a light bar opens under it. The
+user asked to drop the mountain landscape and the "DashCar" stencil (JPEG, Black Ops One font and compass removed:
+app −68 KB, splash PSRAM 1.77 → 2.97 MB free, no JPEG decode at boot). The emblem is an outline polygon from
+gen_logo.py rasterised at boot (no bitmap). A vertical gradient banded visibly on the RGB565 panel: solid colour.
+Verified: four on-device frames (450/830/1250/2400 ms) with the gradient; the final solid colour only by build.
+Done (2026-10-18): Radar shows where the car is going (user request after a real drive: "know if the rain is
+coming or going"). The car marker is a navigation arrow along the GPS course (`ui_heading_marker_*` +
+`ui_gps_heading()` in ui.c, last course kept 2 min while stopped), moved live every 2 s; same arrow on the home
+rain card (1 s). A chip: "Rain N km ahead" / "No rain ahead · nearest …" (40 km along the heading) or "Nearest rain
+N km X" when stopped, plus rain motion from block matching (newest vs ~1 h older frame, 4 px cells, ±100 km/h,
+parabolic sub-cell) and "here in ~N min" from an upstream trace. **RainViewer's translucent beige pixels
+(alpha < 255, red > blue) are weak echoes, not rain**: `pal_rain[]` excludes them (counting them said "Raining
+where you are" on a dry evening). Full-screen snapshots fail while the Radar is open (no 1.2 MB of PSRAM):
+snapshot single objects. Verified on the device (Zaragoza, real radar, simulated 0 km/h fixes + forced heading):
+arrow NE/SSW/dot, home card arrow, chip texts plausible against the map, motion 10–11 km/h. Not yet verified:
+a real drive (live arrow movement, heading from the receiver), ETA accuracy.
 Done (2026-10-14): crash after every Wi-Fi update, found with the new crash recorder: the 20 s "mark new image
 valid" ran in FreeRTOS's timer task (2 KB stack) and overflowed it (stack overflow hook → abort) on the first
 boot of each OTA image. Now the timer posts the work to net_worker. **Never do flash writes or logging in a
@@ -237,7 +262,7 @@ Done (2026-10-14): GPS-following cadence (see the rule above): fuel no longer re
 locally, home card = nearest station from the current position), rain-map "you" dot placed from the current
 position, Parked card shows "N km away" (GPS only), Parking and Traffic screens re-sort every 2 min. Verified:
 build + boot with a GPS fix; the network-side triggers were not exercised (hotspot off during the test).
-Done (2026-10-14): splash = mountain landscape (procedural, JPEG) + compass settling on north + stencil
+Done (2026-10-14, replaced 2026-10-18 by the Dacia emblem): splash = mountain landscape (procedural, JPEG) + compass settling on north + stencil
 "DashCar" (Black Ops One bitmap) + light bar; the user rejected a piston animation in favour of this "nature"
 look. Compass and word mark verified by on-device snapshots; the full composed frame only as a PC mockup.
 The home header still uses the small gauge emblem.

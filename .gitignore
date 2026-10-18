@@ -12,3 +12,6 @@ backup/
 __pycache__/
 *.pyc
 .cache/
+# Private splash emblem (tools/gen_logo.py --dacia): trademark, owner's build only
+main/ui/emblem_private.c
+tools/emblem_private.json

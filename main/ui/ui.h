@@ -59,6 +59,12 @@ void ui_set_hidden_if_changed(lv_obj_t *obj, bool hidden);
 lv_obj_t *ui_speed_sign_create(lv_obj_t *parent, int32_t size);
 void ui_speed_sign_set(lv_obj_t *sign, int kmh, bool over);
 bool ui_speed_over_limit(float kmh, int limit);
+// Map marker: a dot (white ring, half the size) or, given a heading (degrees true), a
+// navigation arrow filling `size`.
+lv_obj_t *ui_heading_marker_create(lv_obj_t *parent, int32_t size, lv_color_t color);
+void ui_heading_marker_set(lv_obj_t *marker, float deg);  // deg < 0: dot
+// Course to show for the car, or -1 (no current fix, or stopped: the course is noise then).
+float ui_gps_heading(void);
 lv_obj_t *ui_button_create(lv_obj_t *parent, const char *text, lv_color_t bg, lv_event_cb_t cb, void *user_data);
 
 // Scrollable flex-column list (replacement for the deprecated lv_list).

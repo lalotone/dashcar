@@ -6,9 +6,19 @@ if(CONFIG_DASHCAR_SOAK)
     list(APPEND srcs_debug "debug/soak.c")      # tools/soak.sh builds only
 endif()
 
+# Splash emblem: the owner's private one (tools/gen_logo.py --dacia, git-ignored) when present,
+# else the DashCar "DC". After adding or removing the private file, run `idf.py reconfigure`.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/ui/emblem_private.c")
+    set(src_emblem "ui/emblem_private.c")
+else()
+    set(src_emblem "ui/emblem.c")
+endif()
+message(STATUS "DashCar splash emblem: ${src_emblem}")
+
 idf_component_register(
     SRCS
         ${srcs_debug}
+        ${src_emblem}
         "main.c"
         "crashlog.c"
         "settings.c"
@@ -59,9 +69,12 @@ idf_component_register(
         esp_driver_gpio esp_driver_i2c esp_driver_uart esp_timer esp_lcd esp_wifi esp_netif esp_event
         esp_http_client esp-tls mbedtls nvs_flash json spiffs espressif__libpng espressif__esp_new_jpeg espressif__mdns espressif__zlib esp_http_server app_update esp_app_format bootloader_support
     EMBED_FILES
-        "ui/splash_bg.jpg"
         "fonts/Montserrat-Medium.ttf"
         "fonts/Montserrat-SemiBold.ttf")
+
+if(src_emblem STREQUAL "ui/emblem_private.c")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DASHCAR_EMBLEM_PRIVATE=1)  # splash composition
+endif()
 
 # crashlog.c records each crash (PCs, task) in RTC memory before the normal panic output.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")

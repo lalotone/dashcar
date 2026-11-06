@@ -195,7 +195,16 @@ from a shell whose own command line contains that string (it kills itself).
   (The Fuel card QR to the nearest station was an explicit earlier request.)
 - Sends messages mid-task; answer them as you go.
 
-## Status (2026-10-18) and ideas
+## Status (2026-11-06) and ideas
+
+Done (2026-11-06): GPS signal screen (`ui/app_gps_signal.c`, opened from the GPS screen's Satellites tile), after a
+drive with no fix (the user suspects the antenna; it worked again after that, cause not measured). `gps.c` now parses GSV signal and GSA; the counts
+are also in the `gps:` log line and on the status page. Verified on the device: real bars, the verdict layouts except "poor accuracy" (forced
+values), tile + swipe back in 10 self-test cycles, no leak. Not yet verified: green "In use" bars and "Good signal"
+with a real fix (none at the desk: 8 received, best 22 dB). `tools/selftest.sh` now captures 540 s.
+Open: the self-test's Cameras and Parked card tests fail in nearly every cycle, also on the previous commit (Explore and
+Settings on the same scrolled rows pass); not investigated. Known false-parking risk, which the user chose not to fix:
+HDOP > 5 reports speed 0 (`gps.c`), so 90 s of poor signal while driving can save a parking spot.
 
 Done (2026-10-18): two splash compositions. **Generic (repo default, `ui/emblem.c`)**: tachometer ignition: ticks
 light up, needle sweeps to the red line and back (arc + ticks follow it), italic "DC" monogram with speed streaks

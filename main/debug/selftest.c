@@ -44,6 +44,13 @@ static void back_swipe(void)
     dbg_touch_swipe(150, 300, 750, 310, 300);
     vTaskDelay(pdMS_TO_TICKS(900));
 }
+static lv_obj_t *active_screen(void)
+{
+    ui_lock();
+    lv_obj_t *scr = lv_screen_active();
+    ui_unlock();
+    return scr;
+}
 static void heap(const char *tag)
 {
     AT("%s: internal %u, psram %u", tag, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -66,6 +73,13 @@ static void selftest_task(void *arg)
         back_swipe();                 expect_home(true, "swipe back from fuel");
         dbg_touch_tap(CARD_GPS);      vTaskDelay(pdMS_TO_TICKS(1000));
         expect_home(false, "gps card opens gps");
+        lv_obj_t *gps_scr = active_screen();
+        dbg_touch_tap(867, 459);      vTaskDelay(pdMS_TO_TICKS(1000));  // satellites tile
+        if (active_screen() == gps_scr) {
+            s_fail++;
+            AT("FAIL: satellites tile opens gps signal");
+        }
+        back_swipe();                 expect_home(false, "swipe back from gps signal goes to gps");
         back_swipe();                 expect_home(true, "swipe back from gps");
         dbg_touch_tap(CARD_TRIP);     vTaskDelay(pdMS_TO_TICKS(1000));
         expect_home(false, "trip card opens trip");

@@ -40,6 +40,23 @@ typedef enum {
 #define GPS_FRESH_S 5     // a fix older than this is "lost" (tunnel, garage)
 #define GPS_MIN_KMH 5.0f  // reported speed below this is noise: shown and used as 0
 #define GPS_MAX_HDOP 5.0f // a worse fix reports speed 0 (its positions wander)
+#define GPS_MAX_SATS 24   // satellites kept per GSV cycle (6 sentences of 4)
+#define GPS_USABLE_SNR 25 // dB-Hz: below about this a receiver can't download a satellite's orbit data
+
+typedef struct {
+    uint8_t prn;
+    uint8_t snr;           // dB-Hz, 0 = listed by the receiver but not received
+    bool    used;          // part of the current fix (GSA)
+} gps_sat_t;
+
+typedef struct {
+    int      listed;       // satellites in the table
+    int      received;     // with any signal
+    int      usable;       // with snr >= GPS_USABLE_SNR
+    int      used;         // part of the current fix
+    int      best_snr;     // strongest signal, 0 if none
+    uint32_t no_fix_s;     // seconds since the last fix (or the first sentence, if none yet)
+} gps_signal_t;
 
 void gps_init(void);
 // Test only (debug/soak.c): replaces the receiver with simulated fixes, ~1/s, until reboot.
@@ -48,5 +65,7 @@ void gps_sim_feed(double lat, double lon, float kmh, float course);
 gps_state_t gps_state(int *sats);
 bool gps_get(gps_fix_t *out);          // false if never had a fix
 void gps_get_stats(gps_stats_t *out);
+// Latest complete GSV cycle, by PRN. `out` may be NULL or holds GPS_MAX_SATS; returns the count.
+int gps_get_sats(gps_sat_t *out, gps_signal_t *signal);
 // "No data from the GPS", "Searching (5 satellites in view)", "Fix, 9 satellites"...
 void gps_status_text(char *buf, size_t len);

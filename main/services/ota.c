@@ -62,12 +62,14 @@ static esp_err_t on_get_root(httpd_req_t *req)
     gps_status_text(gps_text, sizeof(gps_text));
     gps_stats_t gs;
     gps_get_stats(&gs);
+    gps_signal_t sig;
+    gps_get_sats(NULL, &sig);
     char buf[1000];
     snprintf(buf, sizeof(buf),
              "%s %s (built %s %s), running from %s\nPOST the app image to /update\n"
              "heap: internal free %u (largest block %u, min ever %u), psram free %u (largest block %u)\n"
              "uptime %lld s, tasks %u, last reset: %s, brownouts since flashing: %lu\n"
-             "gps: %s, %u bytes, %u sentences, %u bad\n"
+             "gps: %s, %u bytes, %u sentences, %u bad, %d received, %d usable, best %d dB\n"
              "last crash: %s\n",
              app->project_name, app->version, app->date, app->time, ota_running_partition(),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -77,7 +79,8 @@ static esp_err_t on_get_root(httpd_req_t *req)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
              (long long)(esp_log_timestamp() / 1000), (unsigned)uxTaskGetNumberOfTasks(),
              reset_name(esp_reset_reason()), (unsigned long)settings_get_brownouts(),
-             gps_text, (unsigned)gs.bytes, (unsigned)gs.sentences, (unsigned)gs.bad, crash);
+             gps_text, (unsigned)gs.bytes, (unsigned)gs.sentences, (unsigned)gs.bad,
+             sig.received, sig.usable, sig.best_snr, crash);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_sendstr(req, buf);
 }

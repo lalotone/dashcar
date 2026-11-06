@@ -148,6 +148,11 @@ static void update(lv_timer_t *t)
     ui_label_set_text_if_changed(s_sub[T_SATS], buf);
 }
 
+static void on_sats_tile(lv_event_t *e)
+{
+    ui_gps_signal_open();
+}
+
 static void tile_create(lv_obj_t *scr, tile_t id, const char *title, int32_t x, int32_t y)
 {
     lv_obj_t *c = ui_card_create(scr);
@@ -216,6 +221,13 @@ void ui_gps_open(void)
     tile_create(scr, T_LON, "LONGITUDE", x2, BODY_Y);
     tile_create(scr, T_ALT, "ALTITUDE", RIGHT_X, y2);
     tile_create(scr, T_SATS, "SATELLITES", x2, y2);
+
+    // The satellites tile opens the signal bars.
+    lv_obj_t *sats_tile = lv_obj_get_parent(s_value[T_SATS]);
+    lv_obj_set_style_bg_color(sats_tile, UI_COLOR_CARD_HI, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(sats_tile, on_sats_tile, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *more = ui_label_create(scr, ui_font_sm, UI_COLOR_ACCENT, "Signal >");
+    lv_obj_align_to(more, sats_tile, LV_ALIGN_TOP_RIGHT, 0, 0);  // inside the tile's padding
 
     update(NULL);
     ui_screen_own_timer(scr, lv_timer_create(update, 1000, NULL));

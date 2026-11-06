@@ -39,6 +39,16 @@ static float s_gga_alt;
 static bool s_gga_has_alt;
 static gps_stats_t s_stats = { .sats_in_view = -1 };
 static int64_t s_last_sentence_us;
+static int64_t s_first_sentence_us;
+
+// A GSV cycle is collected here and published when complete, so readers never see half of one.
+// The GT-U7 is GPS-only: other talkers would replace this table rather than add to it.
+static gps_sat_t s_gsv[GPS_MAX_SATS];
+static int s_gsv_n;
+static int s_gsv_next;          // sentence index expected next
+static gps_sat_t s_sats[GPS_MAX_SATS];
+static int s_sats_n;
+static uint8_t s_used_prn[12];  // GSA
 
 static char s_line[96];         // NMEA sentences are at most 82 characters
 static size_t s_line_len;
@@ -197,12 +207,55 @@ static void on_gga(char **f, int n)
     s_gga_alt = s_gga_has_alt ? atof(f[9]) : 0;
 }
 
-// $GPGSV,total,index,in_view,...
+// $GPGSV,total,index,in_view,[prn,elevation,azimuth,snr]x4
 static void on_gsv(char **f, int n)
 {
-    if (n >= 4 && f[3][0]) {
-        s_stats.sats_in_view = atoi(f[3]);
+    if (n < 4 || !f[3][0]) {
+        return;
     }
+    s_stats.sats_in_view = atoi(f[3]);
+    const int total = atoi(f[1]), index = atoi(f[2]);
+    if (index == 1) {
+        s_gsv_n = 0;
+        s_gsv_next = 1;
+    }
+    if (index != s_gsv_next) {
+        return;  // lost a sentence: drop this cycle
+    }
+    s_gsv_next++;
+    for (int i = 4; i + 3 < n && s_gsv_n < GPS_MAX_SATS; i += 4) {
+        if (!f[i][0]) {
+            continue;
+        }
+        // Sorted by PRN so that a bar keeps its place on screen.
+        const gps_sat_t sat = { .prn = (uint8_t)atoi(f[i]), .snr = (uint8_t)atoi(f[i + 3]) };
+        int at = s_gsv_n++;
+        for (; at > 0 && s_gsv[at - 1].prn > sat.prn; at--) {
+            s_gsv[at] = s_gsv[at - 1];
+        }
+        s_gsv[at] = sat;
+    }
+    if (index == total) {
+        portENTER_CRITICAL(&s_mux);
+        memcpy(s_sats, s_gsv, s_gsv_n * sizeof(s_gsv[0]));
+        s_sats_n = s_gsv_n;
+        portEXIT_CRITICAL(&s_mux);
+    }
+}
+
+// $GPGSA,mode,fix,[prn]x12,pdop,hdop,vdop: the satellites used in the fix
+static void on_gsa(char **f, int n)
+{
+    if (n < 15) {
+        return;
+    }
+    uint8_t used[sizeof(s_used_prn)];
+    for (int i = 0; i < sizeof(used); i++) {
+        used[i] = (uint8_t)atoi(f[3 + i]);
+    }
+    portENTER_CRITICAL(&s_mux);
+    memcpy(s_used_prn, used, sizeof(used));
+    portEXIT_CRITICAL(&s_mux);
 }
 
 static void on_line(char *s)
@@ -225,6 +278,7 @@ static void on_line(char *s)
     s_last_sentence_us = esp_timer_get_time();
     *star = '\0';
     if (s_stats.sentences == 1) {
+        s_first_sentence_us = s_last_sentence_us;
         ESP_LOGI(TAG, "receiving NMEA: %s", s);
     }
     char *f[20];
@@ -239,6 +293,8 @@ static void on_line(char *s)
         on_gga(f, n);
     } else if (!strcmp(type, "GSV")) {
         on_gsv(f, n);
+    } else if (!strcmp(type, "GSA")) {
+        on_gsa(f, n);
     }
 }
 
@@ -274,8 +330,11 @@ static void poll_cb(void *arg)
         last_log = now;
         char status[64];
         gps_status_text(status, sizeof(status));
-        ESP_LOGI(TAG, "%s (%u bytes, %u sentences, %u bad)", status, (unsigned)s_stats.bytes,
-                 (unsigned)s_stats.sentences, (unsigned)s_stats.bad);
+        gps_signal_t sig;
+        gps_get_sats(NULL, &sig);
+        ESP_LOGI(TAG, "%s (%u bytes, %u sentences, %u bad; %d received, %d usable, best %d dB)", status,
+                 (unsigned)s_stats.bytes, (unsigned)s_stats.sentences, (unsigned)s_stats.bad,
+                 sig.received, sig.usable, sig.best_snr);
     }
 }
 
@@ -340,6 +399,43 @@ bool gps_get(gps_fix_t *out)
 void gps_get_stats(gps_stats_t *out)
 {
     *out = s_stats;
+}
+
+int gps_get_sats(gps_sat_t *out, gps_signal_t *signal)
+{
+    gps_sat_t sats[GPS_MAX_SATS];
+    uint8_t used[sizeof(s_used_prn)];
+    portENTER_CRITICAL(&s_mux);
+    const int n = s_sats_n;
+    memcpy(sats, s_sats, n * sizeof(sats[0]));
+    memcpy(used, s_used_prn, sizeof(used));
+    const int64_t fix_us = s_fix_us, first_us = s_first_sentence_us;
+    portEXIT_CRITICAL(&s_mux);
+
+    gps_signal_t sig = { .listed = n };
+    for (int i = 0; i < n; i++) {
+        for (int u = 0; u < sizeof(used); u++) {
+            if (used[u] && used[u] == sats[i].prn) {
+                sats[i].used = true;
+                sig.used++;
+                break;
+            }
+        }
+        sig.received += sats[i].snr > 0;
+        sig.usable += sats[i].snr >= GPS_USABLE_SNR;
+        if (sats[i].snr > sig.best_snr) {
+            sig.best_snr = sats[i].snr;
+        }
+    }
+    const int64_t since = fix_us > first_us ? fix_us : first_us;
+    sig.no_fix_s = since ? (uint32_t)((esp_timer_get_time() - since) / 1000000) : 0;
+    if (out) {
+        memcpy(out, sats, n * sizeof(sats[0]));
+    }
+    if (signal) {
+        *signal = sig;
+    }
+    return n;
 }
 
 gps_state_t gps_state(int *sats)

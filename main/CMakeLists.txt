@@ -58,6 +58,7 @@ idf_component_register(
         "ui/app_traffic.c"
         "ui/app_parking.c"
         "ui/app_gps.c"
+        "ui/app_gps_signal.c"
         "ui/app_trip.c"
         "ui/app_cameras.c"
         "ui/app_explore.c"

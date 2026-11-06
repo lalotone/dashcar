@@ -159,7 +159,10 @@ checksum checking (`bad` counter = wiring/signal quality). `gps_state()`: no dat
 searching / fix (younger than 5 s). Clock: sets the system time + RTC from the first valid RMC if the clock is
 unset. Speed: below 5 km/h or with HDOP > 5 it's reported as 0 (parked noise is 1–4 km/h, e.g. RMC
 0.86 kn). Parking: after driving (≥ 10 km/h), a stop (< 3 km/h) of 90 s saves the spot. Every fix also feeds
-`trip_on_fix()`. Observed: hot start fix in
+`trip_on_fix()`. GSV also fills a per-satellite table (PRN + signal, published only when a whole cycle arrived) and
+GSA marks the ones in use, for the GPS signal screen; `GPS_USABLE_SNR` (25 dB-Hz) is our rule of thumb for the
+signal needed to download a satellite's orbit data. Satellites "in view" include ones the receiver only lists:
+indoors it listed 11 with 7 received, best 23 dB and no fix, so that count says little. Observed: hot start fix in
 ~2 s; cold start indoors ~2 min with 4–6 satellites; 1 bad sentence in ~1000.
 `location_get()` uses a fix up to 30 min old; all following work runs on `LOCATION_FOLLOW_MS` (2 min) in
 `services/location.h` (thresholds per service in CLAUDE.md).

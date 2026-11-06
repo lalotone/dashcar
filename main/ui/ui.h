@@ -115,6 +115,7 @@ void ui_settings_open(void);
 void ui_traffic_open(void);
 void ui_parking_open(void);
 void ui_gps_open(void);
+void ui_gps_signal_open(void);
 void ui_trip_open(void);
 void ui_cameras_open(void);
 void ui_explore_open(void);
